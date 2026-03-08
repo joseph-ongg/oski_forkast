@@ -1,0 +1,29 @@
+# Project docs (local only)
+CLAUDE.md
+.claude/
+
+# Dependencies
+node_modules/
+
+# Next.js build
+.next/
+
+# Environment variables
+.env*.local
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Debug logs
+npm-debug.log*
+
+# Vercel
+.vercel
+
+# TypeScript
+*.tsbuildinfo
