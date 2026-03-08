@@ -49,12 +49,12 @@ function RatePageContent() {
   const [ratingInput, setRatingInput] = useState('');
   const [showFilters, setShowFilters] = useState(false);
   const [ignoredCategories, setIgnoredCategories] = useState<string[]>([]);
-  const [justRated, setJustRated] = useState<string | null>(null);
   const [rateAll, setRateAll] = useState(false);
   const [rateWeek, setRateWeek] = useState(false);
   const [weekMenus, setWeekMenus] = useState<MenuData[]>([]);
   const [weekLoading, setWeekLoading] = useState(false);
-  const [history, setHistory] = useState<string[]>([]);
+  const [history, setHistory] = useState<{ name: string; rating: number }[]>([]);
+  const [lastAction, setLastAction] = useState<number | null>(null); // rating shown after going back
   const syncTimer = useRef<NodeJS.Timeout | null>(null);
 
   // Debounced cloud sync — pushes to cloud 2s after last rating action
@@ -202,12 +202,9 @@ function RatePageContent() {
       setRankings(newRankings);
       saveRankings(newRankings);
       scheduleCloudSync();
-      setHistory((prev) => [...prev, currentItem.name]);
-      setJustRated(currentItem.name);
+      setHistory((prev) => [...prev, { name: currentItem.name, rating }]);
       setRatingInput('');
-      setTimeout(() => {
-        setJustRated(null);
-      }, 300);
+      setLastAction(null);
     },
     [currentItem, rankings, scheduleCloudSync]
   );
@@ -218,24 +215,23 @@ function RatePageContent() {
     setRankings(newRankings);
     saveRankings(newRankings);
     scheduleCloudSync();
-    setHistory((prev) => [...prev, currentItem.name]);
+    setHistory((prev) => [...prev, { name: currentItem.name, rating: -1 }]);
     setRatingInput('');
-    setJustRated(currentItem.name);
-    setTimeout(() => {
-      setJustRated(null);
-    }, 300);
+    setLastAction(null);
   }, [currentItem, rankings, scheduleCloudSync]);
 
   const handleBack = useCallback(() => {
     if (history.length === 0) return;
-    const prevName = history[history.length - 1];
+    const prev = history[history.length - 1];
     // Remove the rating so it shows as unrated again
     const newRankings = { ...rankings };
-    delete newRankings[prevName];
+    delete newRankings[prev.name];
     setRankings(newRankings);
     saveRankings(newRankings);
-    setHistory((prev) => prev.slice(0, -1));
-    setRatingInput('');
+    setHistory((h) => h.slice(0, -1));
+    // Restore the previous rating/skip state for highlighting
+    setLastAction(prev.rating);
+    setRatingInput(prev.rating > 0 ? String(prev.rating) : '');
     setCurrentIndex(0);
   }, [history, rankings]);
 
@@ -381,7 +377,7 @@ function RatePageContent() {
       )}
 
       {/* All rated */}
-      {!loading && totalUnrated === 0 && totalItems > 0 && (
+      {!loading && !weekLoading && totalUnrated === 0 && totalItems > 0 && (
         <div className="text-center py-16">
           <Check className="w-16 h-16 text-green-500 mx-auto mb-4" />
           <h2 className="text-xl font-bold text-white mb-2">All Done!</h2>
@@ -398,7 +394,7 @@ function RatePageContent() {
       )}
 
       {/* No items */}
-      {!loading && totalItems === 0 && (
+      {!loading && !weekLoading && totalItems === 0 && (
         <div className="text-center py-16">
           <p className="text-slate-400 text-lg">No dishes found</p>
           <p className="text-slate-500 text-sm mt-2">
@@ -408,12 +404,8 @@ function RatePageContent() {
       )}
 
       {/* Current dish card */}
-      {!loading && currentItem && (
-        <div
-          className={`bg-[#111827] rounded-xl border border-slate-800 overflow-hidden transition-all duration-300 ${
-            justRated ? 'opacity-0 scale-95' : 'opacity-100 scale-100'
-          }`}
-        >
+      {!loading && !weekLoading && currentItem && (
+        <div className="bg-[#111827] rounded-xl border border-slate-800 overflow-hidden">
           <div className="p-6">
             <div className="flex flex-wrap gap-2 mb-3">
               {currentItem.categories.map((cat) => (
@@ -461,7 +453,11 @@ function RatePageContent() {
                 <button
                   key={n}
                   onClick={() => handleRate(n)}
-                  className="w-9 h-9 rounded-md bg-[#0a0f1a] border border-slate-700 text-slate-400 text-sm font-medium hover:border-berkeley-gold hover:text-berkeley-gold transition-colors"
+                  className={`w-9 h-9 rounded-md text-sm font-medium transition-colors ${
+                    lastAction === n
+                      ? 'bg-berkeley-gold text-berkeley-blue border border-berkeley-gold'
+                      : 'bg-[#0a0f1a] border border-slate-700 text-slate-400 hover:border-berkeley-gold hover:text-berkeley-gold'
+                  }`}
                 >
                   {n}
                 </button>
@@ -480,10 +476,14 @@ function RatePageContent() {
               </button>
               <button
                 onClick={handleSkip}
-                className="flex-1 py-2.5 text-slate-500 hover:text-slate-300 text-sm font-medium transition-colors flex items-center justify-center gap-2"
+                className={`flex-1 py-2.5 text-sm font-medium transition-colors flex items-center justify-center gap-2 ${
+                  lastAction === -1
+                    ? 'text-red-400'
+                    : 'text-slate-500 hover:text-slate-300'
+                }`}
               >
                 <SkipForward className="w-4 h-4" />
-                Skip
+                {lastAction === -1 ? 'Skipped' : 'Skip'}
               </button>
             </div>
           </div>
@@ -491,7 +491,7 @@ function RatePageContent() {
       )}
 
       {/* Remaining count */}
-      {!loading && currentItem && (
+      {!loading && !weekLoading && currentItem && (
         <p className="text-center text-xs text-slate-600 mt-4">
           {totalUnrated - currentIndex} dish{totalUnrated - currentIndex !== 1 ? 'es' : ''}{' '}
           remaining

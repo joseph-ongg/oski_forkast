@@ -73,7 +73,12 @@ function getMealPeriodsForDate(dateStr: string): string[] {
   return isWeekend ? ['Brunch', 'Dinner'] : ['Breakfast', 'Lunch', 'Dinner'];
 }
 
-const MEAL_PERIODS = ['Breakfast', 'Brunch', 'Lunch', 'Dinner'];
+function getMealPeriodsForDateStr(dateStr: string): string[] {
+  const date = parseDate(dateStr);
+  const day = date.getDay();
+  const isWeekend = day === 0 || day === 6;
+  return isWeekend ? ['Brunch', 'Dinner'] : ['Breakfast', 'Lunch', 'Dinner'];
+}
 
 interface DayPlan {
   dateStr: string;
@@ -151,7 +156,12 @@ export default function DashboardPage() {
 
   useEffect(() => {
     fetchMenus(dateStr);
-  }, [dateStr, fetchMenus]);
+    // Auto-switch meal period if current one isn't valid for this date
+    const validPeriods = getMealPeriodsForDateStr(dateStr);
+    if (!validPeriods.includes(mealPeriod)) {
+      setMealPeriod(validPeriods[0]);
+    }
+  }, [dateStr, fetchMenus, mealPeriod]);
 
   useEffect(() => {
     if (menus.length === 0) {
@@ -226,6 +236,9 @@ export default function DashboardPage() {
   const ratedCount = Object.values(rankings).filter((r) => r > 0).length;
   const bestHall = hallResults.length > 0 ? hallResults[0] : null;
   const isToday = dateStr === formatDate(new Date());
+  const todayStr = formatDate(new Date());
+  const maxDateStr = addDays(todayStr, 7);
+  const canGoForward = dateStr < maxDateStr;
 
   // Count unrated dishes for the current meal to show warning
   const unratedMealCount = useMemo(() => {
@@ -281,6 +294,7 @@ export default function DashboardPage() {
           <input
             type="date"
             value={toInputDate(dateStr)}
+            max={toInputDate(maxDateStr)}
             onChange={(e) => {
               if (e.target.value) setDateStr(fromInputDate(e.target.value));
             }}
@@ -288,8 +302,9 @@ export default function DashboardPage() {
           />
         </div>
         <button
-          onClick={() => setDateStr(addDays(dateStr, 1))}
-          className="w-9 h-9 flex items-center justify-center rounded-lg bg-[#111827] border border-slate-800 hover:border-slate-600 transition-colors"
+          onClick={() => canGoForward && setDateStr(addDays(dateStr, 1))}
+          disabled={!canGoForward}
+          className="w-9 h-9 flex items-center justify-center rounded-lg bg-[#111827] border border-slate-800 hover:border-slate-600 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
         >
           <ChevronRight className="w-4 h-4 text-slate-400" />
         </button>
@@ -307,7 +322,7 @@ export default function DashboardPage() {
 
       {/* Meal Period Tabs */}
       <div className="flex gap-1 mb-4 bg-[#111827] rounded-lg p-1">
-        {MEAL_PERIODS.map((mp) => (
+        {getMealPeriodsForDateStr(dateStr).map((mp) => (
           <button
             key={mp}
             onClick={() => setMealPeriod(mp)}
