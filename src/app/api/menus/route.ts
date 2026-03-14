@@ -21,6 +21,16 @@ function parseAllergens(allergensData: any): string[] {
     .map((a: any) => a['@_id'] || '');
 }
 
+function parseDietaryChoices(dietaryData: any): string[] {
+  if (!dietaryData?.dietaryChoice) return [];
+  const choices = Array.isArray(dietaryData.dietaryChoice)
+    ? dietaryData.dietaryChoice
+    : [dietaryData.dietaryChoice];
+  return choices
+    .filter((c: any) => c['#text'] === 'Yes')
+    .map((c: any) => c['@_id'] || '');
+}
+
 function parseMenu(xmlContent: string, locationName: string, dateStr: string): MenuData | null {
   const parser = new XMLParser({
     ignoreAttributes: false,
@@ -59,8 +69,9 @@ function parseMenu(xmlContent: string, locationName: string, dateStr: string): M
         const category = recipe['@_category'] || 'General';
         const description = recipe['@_description'] || '';
         const allergens = parseAllergens(recipe.allergens);
+        const dietaryChoices = parseDietaryChoices(recipe.dietaryChoices);
 
-        items.push({ name, category, description, allergens });
+        items.push({ name, category, description, allergens, dietaryChoices });
       }
 
       menuData.meals[mealPeriod] = items;

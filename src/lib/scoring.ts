@@ -79,7 +79,8 @@ export function calculateHallScore(
   menu: MenuData,
   rankings: Rankings,
   mealPeriod: string,
-  ignoredCategories: Set<string> = new Set()
+  ignoredCategories: Set<string> = new Set(),
+  excludeItems: Set<string> = new Set()
 ): HallScoreResult {
   if (!(mealPeriod in menu.meals)) {
     return { total_score: 0, stations: [] };
@@ -90,6 +91,9 @@ export function calculateHallScore(
   // Group by category (Station)
   const stations: Record<string, MenuItem[]> = {};
   for (const item of items) {
+    if (excludeItems.size > 0 && excludeItems.has(item.name)) {
+      continue;
+    }
     if (ignoredCategories.size > 0 && ignoredCategories.has(item.category.toLowerCase())) {
       continue;
     }
@@ -131,6 +135,27 @@ export function calculateHallScore(
     total_score: finalScore,
     stations: chosenStations,
   };
+}
+
+/**
+ * Get item names from earlier meal periods for a given hall.
+ * Used to exclude dishes you'd already eat at an earlier meal.
+ */
+export function getEarlierMealItems(menu: MenuData, currentPeriod: string): Set<string> {
+  const order = ['Breakfast', 'Brunch', 'Lunch', 'Dinner'];
+  const currentIdx = order.indexOf(currentPeriod);
+  const items = new Set<string>();
+  if (currentIdx <= 0) return items;
+
+  for (let i = 0; i < currentIdx; i++) {
+    const period = order[i];
+    if (period in menu.meals) {
+      for (const item of menu.meals[period]) {
+        items.add(item.name);
+      }
+    }
+  }
+  return items;
 }
 
 /**

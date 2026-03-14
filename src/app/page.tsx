@@ -1,13 +1,15 @@
 'use client';
 
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { Suspense, useState, useEffect, useCallback, useMemo } from 'react';
 import { useAuth } from './providers';
-import { MenuData, Rankings, HallResult } from '@/lib/types';
-import { calculateHallScore, getCurrentMealPeriod, resolveActivePeriod } from '@/lib/scoring';
-import { loadRankings, loadIgnoredCategories } from '@/lib/storage';
+import { MenuData, Rankings, HallResult, DietaryPreferences, HallDistances } from '@/lib/types';
+import { calculateHallScore, getCurrentMealPeriod, resolveActivePeriod, getEarlierMealItems } from '@/lib/scoring';
+import { loadRankings, loadIgnoredCategories, loadDietaryPreferences, loadHallDistances, loadBaselineScore, isOnboardingComplete } from '@/lib/storage';
+import { getExcludedDishNames, shouldExcludeDish } from '@/lib/dietary';
 import { syncWithCloud } from '@/lib/sync';
 import UserMenu from '@/components/UserMenu';
 import Link from 'next/link';
+import { useRouter, useSearchParams } from 'next/navigation';
 import {
   Utensils,
   Star,
@@ -18,6 +20,7 @@ import {
   AlertTriangle,
   Calendar,
   CalendarDays,
+  Settings,
 } from 'lucide-react';
 
 function formatDate(date: Date): string {
@@ -73,7 +76,12 @@ function getMealPeriodsForDate(dateStr: string): string[] {
   return isWeekend ? ['Brunch', 'Dinner'] : ['Breakfast', 'Lunch', 'Dinner'];
 }
 
-const MEAL_PERIODS = ['Breakfast', 'Brunch', 'Lunch', 'Dinner'];
+function getMealPeriodsForDateStr(dateStr: string): string[] {
+  const date = parseDate(dateStr);
+  const day = date.getDay();
+  const isWeekend = day === 0 || day === 6;
+  return isWeekend ? ['Brunch', 'Dinner'] : ['Breakfast', 'Lunch', 'Dinner'];
+}
 
 interface DayPlan {
   dateStr: string;
@@ -82,18 +90,36 @@ interface DayPlan {
   loading: boolean;
 }
 
+// Points deducted per minute of walk time
+const DISTANCE_PENALTY_PER_MIN = 0.05;
+
 function computeResults(
   menus: MenuData[],
   rankings: Rankings,
   mealPeriod: string,
-  ignoredCategories: string[]
+  ignoredCategories: string[],
+  dietaryPrefs?: DietaryPreferences,
+  hallDistances?: HallDistances
 ): HallResult[] {
   const ignored = new Set(ignoredCategories.map((c) => c.toLowerCase()));
   const results: HallResult[] = [];
   for (const menu of menus) {
     const activePeriod = resolveActivePeriod(menu, mealPeriod);
     if (!activePeriod) continue;
-    const score = calculateHallScore(menu, rankings, activePeriod, ignored);
+    const earlierItems = getEarlierMealItems(menu, activePeriod);
+    // Merge earlier-meal exclusions with dietary exclusions
+    const excludeItems = new Set(earlierItems);
+    if (dietaryPrefs && (dietaryPrefs.diets.length > 0 || dietaryPrefs.allergens.length > 0)) {
+      const mealItems = menu.meals[activePeriod] || [];
+      const dietaryExcluded = getExcludedDishNames(mealItems, dietaryPrefs);
+      dietaryExcluded.forEach((name) => excludeItems.add(name));
+    }
+    const score = calculateHallScore(menu, rankings, activePeriod, ignored, excludeItems);
+    // Apply distance penalty if set
+    if (hallDistances && hallDistances[menu.location] != null && score.total_score > 0) {
+      const penalty = hallDistances[menu.location] * DISTANCE_PENALTY_PER_MIN;
+      score.total_score = Math.max(0, score.total_score - penalty);
+    }
     results.push({ location: menu.location, score, activePeriod });
   }
   results.sort((a, b) => b.score.total_score - a.score.total_score);
@@ -101,18 +127,47 @@ function computeResults(
 }
 
 export default function DashboardPage() {
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => { setMounted(true); }, []);
+
+  if (!mounted) {
+    return (
+      <main className="max-w-2xl mx-auto px-4 py-6">
+        <div className="text-center py-20">
+          <p className="text-slate-400">Loading...</p>
+        </div>
+      </main>
+    );
+  }
+
+  return (
+    <Suspense fallback={<main className="max-w-2xl mx-auto px-4 py-6"><div className="text-center py-20"><p className="text-slate-400">Loading...</p></div></main>}>
+      <DashboardContent />
+    </Suspense>
+  );
+}
+
+function DashboardContent() {
   const { user } = useAuth();
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const initialDate = searchParams.get('date') || formatDate(new Date());
+  const initialMeal = searchParams.get('meal') || getCurrentMealPeriod();
   const [menus, setMenus] = useState<MenuData[]>([]);
   const [rankings, setRankings] = useState<Rankings>({});
-  const [mealPeriod, setMealPeriod] = useState<string>(getCurrentMealPeriod());
-  const [dateStr, setDateStr] = useState<string>(formatDate(new Date()));
+  const [mealPeriod, setMealPeriod] = useState<string>(initialMeal);
+  const [dateStr, setDateStr] = useState<string>(initialDate);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [hallResults, setHallResults] = useState<HallResult[]>([]);
   const [ignoredCategories, setIgnoredCategories] = useState<string[]>([]);
+  const [dietaryPrefs, setDietaryPrefs] = useState<DietaryPreferences>({ diets: [], allergens: [] });
+  const [hallDistances, setHallDistances] = useState<HallDistances>({});
+  const [baselineScore, setBaselineScore] = useState<number | null>(null);
   const [showPlanner, setShowPlanner] = useState(false);
   const [plannerData, setPlannerData] = useState<DayPlan[]>([]);
   const [plannerLoading, setPlannerLoading] = useState(false);
+  const [checkedOnboarding, setCheckedOnboarding] = useState(false);
 
   const fetchMenus = useCallback(async (date: string) => {
     setLoading(true);
@@ -132,44 +187,60 @@ export default function DashboardPage() {
 
   // Sync with cloud when user signs in
   useEffect(() => {
+    const loadData = (r: Rankings, ic: string[]) => {
+      setRankings(r);
+      setIgnoredCategories(ic);
+      setDietaryPrefs(loadDietaryPreferences());
+      setHallDistances(loadHallDistances());
+      setBaselineScore(loadBaselineScore());
+      // Redirect first-time users to onboarding
+      if (Object.keys(r).length === 0 && !isOnboardingComplete()) {
+        router.push('/onboard');
+      }
+      setCheckedOnboarding(true);
+    };
+
     if (user) {
       syncWithCloud()
-        .then(({ rankings: r, ignoredCategories: ic }) => {
-          setRankings(r);
-          setIgnoredCategories(ic);
-        })
-        .catch(() => {
-          // Fallback to localStorage on sync failure
-          setRankings(loadRankings());
-          setIgnoredCategories(loadIgnoredCategories());
-        });
+        .then(({ rankings: r, ignoredCategories: ic }) => loadData(r, ic))
+        .catch(() => loadData(loadRankings(), loadIgnoredCategories()));
     } else {
-      setRankings(loadRankings());
-      setIgnoredCategories(loadIgnoredCategories());
+      loadData(loadRankings(), loadIgnoredCategories());
     }
-  }, [user]);
+  }, [user, router]);
 
   useEffect(() => {
     fetchMenus(dateStr);
-  }, [dateStr, fetchMenus]);
+    // Auto-switch meal period if current one isn't valid for this date
+    const validPeriods = getMealPeriodsForDateStr(dateStr);
+    if (!validPeriods.includes(mealPeriod)) {
+      setMealPeriod(validPeriods[0]);
+    }
+  }, [dateStr, fetchMenus, mealPeriod]);
 
   useEffect(() => {
     if (menus.length === 0) {
       setHallResults([]);
       return;
     }
-    setHallResults(computeResults(menus, rankings, mealPeriod, ignoredCategories));
-  }, [menus, rankings, mealPeriod, ignoredCategories]);
+    setHallResults(computeResults(menus, rankings, mealPeriod, ignoredCategories, dietaryPrefs, hallDistances));
+  }, [menus, rankings, mealPeriod, ignoredCategories, dietaryPrefs, hallDistances]);
 
   useEffect(() => {
     const onStorage = () => {
       setRankings(loadRankings());
       setIgnoredCategories(loadIgnoredCategories());
+      setDietaryPrefs(loadDietaryPreferences());
+      setHallDistances(loadHallDistances());
+      setBaselineScore(loadBaselineScore());
     };
     window.addEventListener('storage', onStorage);
     const onFocus = () => {
       setRankings(loadRankings());
       setIgnoredCategories(loadIgnoredCategories());
+      setDietaryPrefs(loadDietaryPreferences());
+      setHallDistances(loadHallDistances());
+      setBaselineScore(loadBaselineScore());
     };
     window.addEventListener('focus', onFocus);
     return () => {
@@ -212,10 +283,12 @@ export default function DashboardPage() {
 
     const currentRankings = loadRankings();
     const currentIgnored = loadIgnoredCategories();
+    const currentDietary = loadDietaryPreferences();
+    const currentDistances = loadHallDistances();
 
     const updatedDays = days.map((day) => {
       const dayMenus = menuCache[day.dateStr] || [];
-      const results = computeResults(dayMenus, currentRankings, day.mealPeriod, currentIgnored);
+      const results = computeResults(dayMenus, currentRankings, day.mealPeriod, currentIgnored, currentDietary, currentDistances);
       return { ...day, results, loading: false };
     });
 
@@ -226,6 +299,9 @@ export default function DashboardPage() {
   const ratedCount = Object.values(rankings).filter((r) => r > 0).length;
   const bestHall = hallResults.length > 0 ? hallResults[0] : null;
   const isToday = dateStr === formatDate(new Date());
+  const todayStr = formatDate(new Date());
+  const maxDateStr = addDays(todayStr, 7);
+  const canGoForward = dateStr < maxDateStr;
 
   // Count unrated dishes for the current meal to show warning
   const unratedMealCount = useMemo(() => {
@@ -237,6 +313,7 @@ export default function DashboardPage() {
       if (!period || !menu.meals[period]) continue;
       for (const item of menu.meals[period]) {
         if (ignoredLower.has(item.category.toLowerCase())) continue;
+        if (shouldExcludeDish(item, dietaryPrefs)) continue;
         itemNames.add(item.name);
       }
     }
@@ -245,7 +322,7 @@ export default function DashboardPage() {
       if (!(name in rankings)) unrated++;
     });
     return unrated;
-  }, [menus, rankings, mealPeriod, ignoredCategories]);
+  }, [menus, rankings, mealPeriod, ignoredCategories, dietaryPrefs]);
 
   return (
     <main className="max-w-2xl mx-auto px-4 py-6">
@@ -258,6 +335,13 @@ export default function DashboardPage() {
           </h1>
         </div>
         <div className="flex items-center gap-2">
+          <Link
+            href="/onboard"
+            className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-[#111827] border border-slate-800 hover:border-slate-600 transition-colors text-slate-400 hover:text-slate-200"
+          >
+            <Settings className="w-4 h-4" />
+            <span className="text-xs font-medium">Settings</span>
+          </Link>
           <UserMenu />
           <Link
             href={`/rate?date=${dateStr}&meal=${mealPeriod}`}
@@ -281,6 +365,7 @@ export default function DashboardPage() {
           <input
             type="date"
             value={toInputDate(dateStr)}
+            max={toInputDate(maxDateStr)}
             onChange={(e) => {
               if (e.target.value) setDateStr(fromInputDate(e.target.value));
             }}
@@ -288,8 +373,9 @@ export default function DashboardPage() {
           />
         </div>
         <button
-          onClick={() => setDateStr(addDays(dateStr, 1))}
-          className="w-9 h-9 flex items-center justify-center rounded-lg bg-[#111827] border border-slate-800 hover:border-slate-600 transition-colors"
+          onClick={() => canGoForward && setDateStr(addDays(dateStr, 1))}
+          disabled={!canGoForward}
+          className="w-9 h-9 flex items-center justify-center rounded-lg bg-[#111827] border border-slate-800 hover:border-slate-600 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
         >
           <ChevronRight className="w-4 h-4 text-slate-400" />
         </button>
@@ -307,7 +393,7 @@ export default function DashboardPage() {
 
       {/* Meal Period Tabs */}
       <div className="flex gap-1 mb-4 bg-[#111827] rounded-lg p-1">
-        {MEAL_PERIODS.map((mp) => (
+        {getMealPeriodsForDateStr(dateStr).map((mp) => (
           <button
             key={mp}
             onClick={() => setMealPeriod(mp)}
@@ -355,6 +441,7 @@ export default function DashboardPage() {
               const best = day.results.length > 0 && day.results[0].score.total_score > 0
                 ? day.results[0]
                 : null;
+              const belowBaseline = best && baselineScore !== null && best.score.total_score < baselineScore;
               const isFirst = i === 0 || plannerData[i - 1].dateStr !== day.dateStr;
               return (
                 <div key={`${day.dateStr}-${day.mealPeriod}`}>
@@ -363,19 +450,30 @@ export default function DashboardPage() {
                       {shortDisplayDate(day.dateStr)}
                     </p>
                   )}
-                  <div className="bg-[#111827] rounded-lg p-3 border border-slate-800 flex items-center justify-between">
+                  <div className={`bg-[#111827] rounded-lg p-3 border flex items-center justify-between ${
+                    belowBaseline ? 'border-amber-700/40' : 'border-slate-800'
+                  }`}>
                     <div className="flex items-center gap-3">
                       <span className="text-xs font-medium text-slate-500 w-16">
                         {day.mealPeriod}
                       </span>
                       {best ? (
-                        <span className="text-sm font-semibold text-white">{best.location}</span>
+                        <div>
+                          <span className={`text-sm font-semibold ${belowBaseline ? 'text-amber-300' : 'text-white'}`}>
+                            {best.location}
+                          </span>
+                          {belowBaseline && (
+                            <p className="text-xs text-amber-400/70">Try a cafe instead</p>
+                          )}
+                        </div>
                       ) : (
                         <span className="text-sm text-slate-600">No data</span>
                       )}
                     </div>
                     {best && (
-                      <span className="text-sm font-bold text-berkeley-gold">
+                      <span className={`text-sm font-bold ${
+                        belowBaseline ? 'text-amber-400' : 'text-berkeley-gold'
+                      }`}>
                         {best.score.total_score.toFixed(1)}
                       </span>
                     )}
@@ -423,7 +521,7 @@ export default function DashboardPage() {
               {unratedMealCount} unrated dish{unratedMealCount !== 1 ? 'es' : ''} for {mealPeriod}
             </p>
             <p className="text-amber-400/70 text-xs mt-0.5">
-              Recommendations may be inaccurate with missing ratings
+              Rate them for accurate scores — predictions can speed things up
             </p>
           </div>
           <Link
@@ -437,9 +535,19 @@ export default function DashboardPage() {
 
       {/* Recommendation Banner */}
       {bestHall && bestHall.score.total_score > 0 && (
-        <div className="bg-gradient-to-r from-berkeley-blue to-[#004080] border border-berkeley-gold/30 rounded-xl p-5 mb-6">
-          <p className="text-berkeley-gold text-xs font-semibold uppercase tracking-wider mb-1">
-            Recommended
+        <div className={`rounded-xl p-5 mb-6 border ${
+          baselineScore !== null && bestHall.score.total_score < baselineScore
+            ? 'bg-gradient-to-r from-amber-900/30 to-amber-800/20 border-amber-700/40'
+            : 'bg-gradient-to-r from-berkeley-blue to-[#004080] border-berkeley-gold/30'
+        }`}>
+          <p className={`text-xs font-semibold uppercase tracking-wider mb-1 ${
+            baselineScore !== null && bestHall.score.total_score < baselineScore
+              ? 'text-amber-400'
+              : 'text-berkeley-gold'
+          }`}>
+            {baselineScore !== null && bestHall.score.total_score < baselineScore
+              ? 'Use a meal swipe elsewhere'
+              : 'Recommended'}
           </p>
           <div className="flex items-center justify-between">
             <h2 className="text-2xl font-bold text-white">{bestHall.location}</h2>
@@ -509,6 +617,7 @@ export default function DashboardPage() {
                     <p className="text-xs text-slate-500">
                       {hall.activePeriod}
                       {hall.activePeriod !== mealPeriod && ` (showing ${hall.activePeriod})`}
+                      {hallDistances[hall.location] != null && ` · ${hallDistances[hall.location]} min walk`}
                     </p>
                   </div>
                 </div>

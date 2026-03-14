@@ -3,6 +3,12 @@ export interface MenuItem {
   category: string;
   description: string;
   allergens: string[];
+  dietaryChoices: string[];
+}
+
+export interface DietaryPreferences {
+  diets: string[];      // e.g. ["Vegan Option", "Halal"] — require presence
+  allergens: string[];  // e.g. ["Peanut", "Milk"] — require absence
 }
 
 export interface MealData {
@@ -35,3 +41,16 @@ export interface HallResult {
 }
 
 export type Rankings = Record<string, number>;
+
+// Hall name → walk time in minutes (0 = on-site, unset = no penalty)
+export type HallDistances = Record<string, number>;
+
+export type CategoryPreferenceLevel = 'love' | 'good' | 'fine' | 'meh' | 'skip';
+export type CategoryPreferences = Record<string, CategoryPreferenceLevel>;
+
+export interface Prediction {
+  rating: number; // -1 means predicted skip
+  confidence: number;
+  similarDishes: { name: string; rating: number; similarity: number }[];
+  predictedSkip: boolean;
+}
