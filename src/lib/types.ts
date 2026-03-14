@@ -42,6 +42,12 @@ export interface HallResult {
 
 export type Rankings = Record<string, number>;
 
+// Hall name → walk time in minutes (0 = on-site, unset = no penalty)
+export type HallDistances = Record<string, number>;
+
+export type CategoryPreferenceLevel = 'love' | 'good' | 'fine' | 'meh' | 'skip';
+export type CategoryPreferences = Record<string, CategoryPreferenceLevel>;
+
 export interface Prediction {
   rating: number; // -1 means predicted skip
   confidence: number;

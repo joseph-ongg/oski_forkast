@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { tokenize, computeIDF, similarity, predict, predictAll } from '../prediction';
-import { Rankings } from '../types';
+import { tokenize, computeIDF, similarity, predict, predictAll, predictFromCategories } from '../prediction';
+import { Rankings, CategoryPreferences } from '../types';
 
 describe('tokenize', () => {
   it('splits dish names into lowercase keywords', () => {
@@ -322,5 +322,114 @@ describe('predictAll', () => {
       {}
     );
     expect(predictions.size).toBe(0);
+  });
+});
+
+describe('predictFromCategories', () => {
+  it('predicts rating for a dish matching a loved category', () => {
+    const catPrefs: CategoryPreferences = {
+      'Chicken & Poultry': 'love',
+    };
+    const pred = predictFromCategories('Grilled Chicken', catPrefs);
+    expect(pred).not.toBeNull();
+    expect(pred!.rating).toBe(9);
+    expect(pred!.predictedSkip).toBe(false);
+    expect(pred!.confidence).toBe(0.75); // love → high confidence
+  });
+
+  it('predicts skip for a skipped category', () => {
+    const catPrefs: CategoryPreferences = {
+      'Fish & Seafood': 'skip',
+    };
+    const pred = predictFromCategories('Baked Salmon', catPrefs);
+    expect(pred).not.toBeNull();
+    expect(pred!.predictedSkip).toBe(true);
+    expect(pred!.rating).toBe(-1);
+  });
+
+  it('combines multiple matching categories with weights', () => {
+    const catPrefs: CategoryPreferences = {
+      'Chicken & Poultry': 'love',
+      'Asian Cuisine': 'good',
+    };
+    // "Teriyaki Chicken" should match poultry (weight 1.0) + asian (weight 0.5)
+    const pred = predictFromCategories('Teriyaki Chicken', catPrefs);
+    expect(pred).not.toBeNull();
+    expect(pred!.confidence).toBe(0.80); // love(0.75) + 1 extra match → 0.80
+    // Weighted avg: (1.0 * 9.0 + 0.5 * 7.5) / 1.5 = 12.75 / 1.5 = 8.5
+    expect(pred!.rating).toBe(8.5);
+  });
+
+  it('returns null for empty preferences', () => {
+    const pred = predictFromCategories('Grilled Chicken', {});
+    expect(pred).toBeNull();
+  });
+
+  it('returns null when no taxonomy groups match', () => {
+    const catPrefs: CategoryPreferences = {
+      'Beef': 'love',
+    };
+    // "Green Beans" doesn't match beef taxonomy
+    const pred = predictFromCategories('Chocolate Cake', catPrefs);
+    // cake is not in onboarding groups, so no match
+    expect(pred).toBeNull();
+  });
+
+  it('predicts meh category correctly', () => {
+    const catPrefs: CategoryPreferences = {
+      'Soup & Stew': 'meh',
+    };
+    const pred = predictFromCategories('Chicken Soup', catPrefs);
+    expect(pred).not.toBeNull();
+    expect(pred!.rating).toBe(3);
+  });
+
+  it('cuisine weight is lower than protein weight', () => {
+    const catPrefs: CategoryPreferences = {
+      'Beef': 'love',         // weight 1.0 → 9.0
+      'Mexican Food': 'meh',  // weight 0.5 → 3.0
+    };
+    // "Beef Taco" → beef (1.0 * 9.0) + mexican (0.5 * 3.0) = 10.5 / 1.5 = 7.0
+    const pred = predictFromCategories('Beef Taco', catPrefs);
+    expect(pred).not.toBeNull();
+    expect(pred!.rating).toBe(7);
+  });
+});
+
+describe('predict with categoryPreferences fallback', () => {
+  it('uses category prediction when no dish-level ratings exist', () => {
+    const catPrefs: CategoryPreferences = {
+      'Chicken & Poultry': 'love',
+    };
+    const pred = predict(
+      { name: 'Fried Chicken' },
+      {}, // no rankings
+      ['Fried Chicken'],
+      undefined,
+      catPrefs
+    );
+    expect(pred).not.toBeNull();
+    expect(pred!.rating).toBe(9);
+  });
+
+  it('dish-level prediction overrides category prediction when confident', () => {
+    const rankings: Rankings = {
+      'Grilled Chicken': 5,
+      'Baked Chicken': 4,
+      'Roasted Chicken': 3,
+    };
+    const catPrefs: CategoryPreferences = {
+      'Chicken & Poultry': 'love', // would predict 9
+    };
+    const pred = predict(
+      { name: 'Fried Chicken' },
+      rankings,
+      ['Fried Chicken', 'Grilled Chicken', 'Baked Chicken', 'Roasted Chicken'],
+      undefined,
+      catPrefs
+    );
+    expect(pred).not.toBeNull();
+    // Should use dish-level prediction (around 4-5), not category (9)
+    expect(pred!.rating).toBeLessThan(7);
   });
 });

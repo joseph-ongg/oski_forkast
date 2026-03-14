@@ -49,7 +49,7 @@ export async function GET(request: Request) {
     .select('category')
     .eq('user_id', userId);
 
-  const ignoredList = ignored ? ignored.map((i: any) => i.category) : [];
+  const ignoredList = ignored ? ignored.map((i: { category: string }) => i.category) : [];
 
   return NextResponse.json({ rankings: rankingsMap, ignored_categories: ignoredList });
 }
@@ -72,13 +72,15 @@ export async function POST(request: Request) {
     ignored_categories: string[];
   };
 
-  // Upsert rankings
+  // Validate and upsert rankings
   if (rankings && Object.keys(rankings).length > 0) {
-    const rows = Object.entries(rankings).map(([dish_name, rating]) => ({
-      user_id: userId,
-      dish_name,
-      rating,
-    }));
+    const rows: { user_id: string; dish_name: string; rating: number }[] = [];
+    for (const [dish_name, rating] of Object.entries(rankings)) {
+      if (typeof rating !== 'number' || (rating !== -1 && (rating < 1 || rating > 10))) {
+        continue; // skip invalid ratings silently
+      }
+      rows.push({ user_id: userId, dish_name, rating });
+    }
 
     // Batch upsert in chunks of 500
     for (let i = 0; i < rows.length; i += 500) {
@@ -89,6 +91,7 @@ export async function POST(request: Request) {
 
       if (error) {
         console.error('Error upserting rankings:', error);
+        return NextResponse.json({ error: 'Failed to save rankings' }, { status: 500 });
       }
     }
   }

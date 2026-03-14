@@ -11,12 +11,19 @@ import {
   saveIgnoredCategories,
   loadDietaryPreferences,
   saveDietaryPreferences,
+  loadCategoryPreferences,
+  loadAutoAccept,
+  saveAutoAccept,
+  loadEntreesOnly,
+  saveEntreesOnly,
+  loadVeganMeatPref,
 } from '@/lib/storage';
+import { CategoryPreferences } from '@/lib/types';
 import { shouldExcludeDish } from '@/lib/dietary';
 import { pushToCloud, syncWithCloud } from '@/lib/sync';
 import Link from 'next/link';
 import { ArrowLeft, SkipForward, Check, Star, Filter, X, ChevronLeft, Layers, CalendarRange, Sparkles, Search, Zap, Shield } from 'lucide-react';
-import { predict, tokenize } from '@/lib/prediction';
+import { predict, predictAll, tokenize, scoreDishUsefulness } from '@/lib/prediction';
 import { Prediction } from '@/lib/types';
 import { useSearchParams } from 'next/navigation';
 
@@ -64,13 +71,36 @@ function RatePageContent() {
   const [lastAction, setLastAction] = useState<number | null>(null); // rating shown after going back
   const [searchQuery, setSearchQuery] = useState('');
   const [searchOpen, setSearchOpen] = useState(false);
-  const [autoSkipCondiments, setAutoSkipCondiments] = useState(false);
+  const [entreesOnly, setEntreesOnlyState] = useState(false);
   const [showDietary, setShowDietary] = useState(false);
   const [dietaryPrefs, setDietaryPrefs] = useState<DietaryPreferences>({ diets: [], allergens: [] });
+  const [categoryPrefs, setCategoryPrefs] = useState<CategoryPreferences>({});
+  const [veganMeatPref, setVeganMeatPref] = useState<boolean | null>(null);
   const [expandedSearchItem, setExpandedSearchItem] = useState<string | null>(null);
   const [searchRatingInput, setSearchRatingInput] = useState('');
+  const [autoAccept, setAutoAcceptState] = useState(false);
+  const [pendingAutoAccept, setPendingAutoAccept] = useState<{ name: string; rating: number }[]>([]);
+  const [autoAcceptedItems, setAutoAcceptedItems] = useState<{ name: string; rating: number }[]>([]);
+  const [showAutoAcceptReview, setShowAutoAcceptReview] = useState(false);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const syncTimer = useRef<NodeJS.Timeout | null>(null);
+  const undoneItemsRef = useRef<Set<string>>(new Set());
+
+  // Persist-aware setters
+  const setAutoAccept = useCallback((val: boolean) => {
+    setAutoAcceptState(val);
+    saveAutoAccept(val);
+    if (!val) {
+      setPendingAutoAccept([]);
+      setAutoAcceptedItems([]);
+      undoneItemsRef.current.clear();
+    }
+  }, []);
+
+  const setEntreesOnly = useCallback((val: boolean) => {
+    setEntreesOnlyState(val);
+    saveEntreesOnly(val);
+  }, []);
 
   // Debounced cloud sync — pushes to cloud 2s after last rating action
   const scheduleCloudSync = useCallback(() => {
@@ -82,22 +112,29 @@ function RatePageContent() {
   }, [user]);
 
   useEffect(() => {
+    const loadExtras = () => {
+      setDietaryPrefs(loadDietaryPreferences());
+      setCategoryPrefs(loadCategoryPreferences());
+      setAutoAcceptState(loadAutoAccept());
+      setEntreesOnlyState(loadEntreesOnly());
+      setVeganMeatPref(loadVeganMeatPref());
+    };
     if (user) {
       syncWithCloud()
         .then(({ rankings: r, ignoredCategories: ic }) => {
           setRankings(r);
           setIgnoredCategories(ic);
-          setDietaryPrefs(loadDietaryPreferences());
+          loadExtras();
         })
         .catch(() => {
           setRankings(loadRankings());
           setIgnoredCategories(loadIgnoredCategories());
-          setDietaryPrefs(loadDietaryPreferences());
+          loadExtras();
         });
     } else {
       setRankings(loadRankings());
       setIgnoredCategories(loadIgnoredCategories());
-      setDietaryPrefs(loadDietaryPreferences());
+      loadExtras();
     }
   }, [user]);
 
@@ -220,16 +257,88 @@ function RatePageContent() {
     };
   }, [menus, weekMenus, mealParam, ignoredCategories, rateAll, rateWeek, dietaryPrefs]);
 
-  // Unrated items
-  const unratedItems = useMemo(
-    () => allItems.filter((item) => !(item.name in rankings)),
-    [allItems, rankings]
-  );
+  // Non-entree detection using category (station) + name patterns.
+  // Category is the primary signal — way more reliable than parsing dish names.
+  const isNonEntree = useCallback((item: UniqueItem): boolean => {
+    const catLower = item.categories.map(c => c.toLowerCase());
+
+    // Categories that are NEVER entrees — skip everything from these
+    const JUNK_CATEGORIES = [
+      'condiment', 'beverage', 'cereal', 'bakery', 'bread',
+      'salad bar', 'deli bar', 'fruit', 'topping',
+    ];
+    if (catLower.some(c => JUNK_CATEGORIES.some(j => c.includes(j)))) return true;
+
+    // Name-based patterns that are never entrees regardless of station
+    const lower = item.name.toLowerCase();
+
+    // Prep patterns: "Sliced X", "Diced X", etc.
+    if (/^(sliced|diced|shredded|chopped|fresh|raw|whole|dried)\s/.test(lower)) return true;
+
+    // Dressings, vinaigrettes, sauces (standalone)
+    if (/dressing|vinaigrette|vinegar|aioli|mayo|gravy|syrup|jelly|jam\b/.test(lower)) return true;
+
+    // Single ingredients that aren't dishes (1-2 tokens)
+    const tokens = tokenize(item.name);
+    if (tokens.length <= 2) {
+      const INGREDIENT_WORDS = new Set([
+        'tomato', 'tomatoes', 'cucumber', 'cucumbers', 'lettuce', 'spinach',
+        'arugula', 'kale', 'cabbage', 'radish', 'radishes', 'beet', 'beets',
+        'carrot', 'carrots', 'celery', 'onion', 'onions', 'peppers',
+        'olives', 'pickles', 'jalapenos', 'mushrooms',
+        'raisins', 'cranberries', 'croutons',
+        'apple', 'apples', 'banana', 'bananas', 'orange', 'oranges',
+        'melon', 'grapes', 'berries', 'strawberries', 'blueberries',
+        'pineapple', 'mango', 'peach', 'pear', 'plum', 'kiwi',
+        'salt', 'pepper', 'ketchup', 'mustard', 'relish', 'salsa',
+        'butter', 'margarine', 'cream', 'sour', 'whipped',
+        'cheese', 'cheddar', 'mozzarella', 'parmesan', 'provolone', 'swiss',
+        'feta', 'gouda', 'brie', 'ricotta', 'queso',
+        'ranch', 'hummus', 'guacamole', 'pesto', 'tahini', 'tzatziki',
+        'honey', 'sugar', 'cinnamon', 'nutmeg',
+        'oil', 'olive', 'lemon', 'lime', 'garlic', 'ginger',
+        'basil', 'cilantro', 'parsley', 'mint', 'dill', 'chives',
+        'oregano', 'thyme', 'rosemary', 'sage',
+        'almonds', 'walnuts', 'pecans', 'cashews', 'peanuts',
+        'granola', 'oatmeal', 'yogurt',
+        'chips', 'crackers', 'tortilla',
+        'broth', 'stock', 'milk', 'juice', 'water', 'coffee', 'tea',
+        'sprouts', 'sprinkles',
+      ]);
+      if (tokens.every(t => INGREDIENT_WORDS.has(t))) return true;
+    }
+
+    return false;
+  }, []);
+
+  // Unrated items, sorted by station then by keyword similarity within each station.
+  // When entreesOnly is on, non-entree items are filtered out (not marked -1).
+  const unratedItems = useMemo(() => {
+    let unrated = allItems.filter((item) => !(item.name in rankings));
+    if (entreesOnly) {
+      unrated = unrated.filter((item) => !isNonEntree(item));
+    }
+    return unrated.sort((a, b) => {
+      // Primary: group by station (first category alphabetically)
+      const catA = (a.categories[0] || '').toLowerCase();
+      const catB = (b.categories[0] || '').toLowerCase();
+      if (catA !== catB) return catA.localeCompare(catB);
+      // Secondary: sort by shared keywords (items with similar names cluster together)
+      const tokensA = tokenize(a.name);
+      const tokensB = tokenize(b.name);
+      // Use first keyword as sub-group, then full name
+      const keyA = tokensA[0] || '';
+      const keyB = tokensB[0] || '';
+      if (keyA !== keyB) return keyA.localeCompare(keyB);
+      return a.name.localeCompare(b.name);
+    });
+  }, [allItems, rankings, entreesOnly, isNonEntree]);
 
   const currentItem = unratedItems[currentIndex] || null;
   const totalUnrated = unratedItems.length;
-  const totalItems = allItems.length;
-  const ratedCount = totalItems - totalUnrated;
+  const displayItems = entreesOnly ? allItems.filter((item) => !isNonEntree(item)) : allItems;
+  const totalItems = displayItems.length;
+  const ratedCount = displayItems.filter((item) => item.name in rankings).length;
 
   // Predict rating for current dish
   const currentPrediction: Prediction | null = useMemo(() => {
@@ -245,40 +354,27 @@ function RatePageContent() {
       { name: currentItem.name, category: currentItem.categories[0] },
       rankings,
       allDishNames,
-      dishCategories
+      dishCategories,
+      categoryPrefs
     );
-  }, [currentItem, rankings, allItems]);
+  }, [currentItem, rankings, allItems, categoryPrefs]);
 
-  // Single-ingredient condiment/garnish detection
-  const isCondimentOrGarnish = useCallback((name: string): boolean => {
-    const tokens = tokenize(name);
-    if (tokens.length > 2) return false;
-    const CONDIMENT_WORDS = new Set([
-      'salt', 'pepper', 'ketchup', 'mustard', 'mayo', 'mayonnaise', 'sauce',
-      'soy', 'sriracha', 'tabasco', 'vinegar', 'oil', 'olive', 'butter',
-      'margarine', 'jam', 'jelly', 'honey', 'syrup', 'sugar', 'cream',
-      'dressing', 'ranch', 'relish', 'salsa', 'guacamole', 'hummus',
-      'basil', 'cilantro', 'parsley', 'mint', 'chive', 'chives', 'dill',
-      'oregano', 'thyme', 'rosemary', 'sage', 'tarragon', 'cumin',
-      'lemon', 'lime', 'croutons', 'crouton', 'tortilla', 'chips',
-      'sour', 'whipped', 'gravy', 'broth', 'stock',
-      'cheddar', 'mozzarella', 'parmesan', 'provolone', 'swiss',
-      'pickles', 'pickle', 'olives', 'jalapeno', 'jalapenos',
-      'onion', 'onions', 'garlic', 'ginger', 'scallion', 'scallions',
-      'peanut', 'almond', 'walnut', 'pecan', 'cashew',
-      'sprouts', 'sprinkles', 'granola', 'crumble',
-    ]);
-    // If all tokens are condiment words, it's a condiment
-    return tokens.length >= 1 && tokens.every(t => CONDIMENT_WORDS.has(t));
+  // Auto-skip vegan meat dishes when user said "no" to vegan meat
+  const isVeganMeatDish = useCallback((name: string): boolean => {
+    const lower = name.toLowerCase();
+    const veganMarkers = ['vegan', 'plant', 'impossible', 'beyond', 'meatless', 'veggie'];
+    const meatWords = ['chicken', 'turkey', 'beef', 'burger', 'sausage', 'meatball', 'bacon', 'ham', 'pork', 'steak', 'patty', 'tender', 'nugget', 'wing'];
+    const hasVeganMarker = veganMarkers.some(m => lower.includes(m));
+    const hasMeatWord = meatWords.some(m => lower.includes(m));
+    return hasVeganMarker && hasMeatWord;
   }, []);
 
-  // Auto-skip condiments when toggle is on
   useEffect(() => {
-    if (!autoSkipCondiments || loading || weekLoading) return;
+    if (veganMeatPref !== false || loading || weekLoading) return;
     let changed = false;
     const newRankings = { ...rankings };
     for (const item of unratedItems) {
-      if (isCondimentOrGarnish(item.name)) {
+      if (isVeganMeatDish(item.name)) {
         newRankings[item.name] = -1;
         changed = true;
       }
@@ -288,7 +384,56 @@ function RatePageContent() {
       saveRankings(newRankings);
       scheduleCloudSync();
     }
-  }, [autoSkipCondiments, unratedItems, loading, weekLoading]);
+  }, [veganMeatPref, unratedItems, loading, weekLoading]);
+
+  // Auto-accept: collect pending predictions (don't apply instantly)
+  useEffect(() => {
+    if (!autoAccept || loading || weekLoading) return;
+    if (unratedItems.length === 0) { setPendingAutoAccept([]); return; }
+
+    const dishContexts = unratedItems
+      .filter((item) => !undoneItemsRef.current.has(item.name))
+      .map((item) => ({
+        name: item.name,
+        category: item.categories[0],
+      }));
+    if (dishContexts.length === 0) { setPendingAutoAccept([]); return; }
+
+    const dishCategories: Record<string, string> = {};
+    for (const item of allItems) {
+      if (item.categories.length > 0) dishCategories[item.name] = item.categories[0];
+    }
+
+    const predictions = predictAll(dishContexts, rankings, dishCategories, categoryPrefs);
+    const pending: { name: string; rating: number }[] = [];
+
+    for (const [name, pred] of Array.from(predictions.entries())) {
+      if (undoneItemsRef.current.has(name)) continue;
+      // Require at least 3 similar dishes backing the prediction
+      if (pred.similarDishes.length < 3) continue;
+      if (pred.predictedSkip && pred.confidence >= 0.70) {
+        pending.push({ name, rating: -1 });
+      } else if (!pred.predictedSkip && pred.confidence >= 0.65) {
+        pending.push({ name, rating: pred.rating });
+      }
+    }
+
+    setPendingAutoAccept(pending);
+  }, [autoAccept, unratedItems, loading, weekLoading, allItems, rankings, categoryPrefs]);
+
+  // Apply all pending auto-accept predictions
+  const applyPendingAutoAccept = useCallback(() => {
+    if (pendingAutoAccept.length === 0) return;
+    const newRankings = { ...rankings };
+    for (const item of pendingAutoAccept) {
+      newRankings[item.name] = item.rating;
+    }
+    setRankings(newRankings);
+    saveRankings(newRankings);
+    scheduleCloudSync();
+    setAutoAcceptedItems((prev) => [...prev, ...pendingAutoAccept]);
+    setPendingAutoAccept([]);
+  }, [pendingAutoAccept, rankings, scheduleCloudSync]);
 
   // Search results
   const searchResults = useMemo(() => {
@@ -320,12 +465,13 @@ function RatePageContent() {
         { name: item.name, category: item.categories[0] },
         rankings,
         allDishNames,
-        dishCategories
+        dishCategories,
+        categoryPrefs
       );
       if (pred) preds.set(item.name, pred);
     }
     return preds;
-  }, [searchQuery, unratedSearchResults, rankings, allItems]);
+  }, [searchQuery, unratedSearchResults, rankings, allItems, categoryPrefs]);
 
   // Mass skip all unrated search results
   const handleMassSkip = useCallback(() => {
@@ -480,13 +626,24 @@ function RatePageContent() {
           <Search className="w-4 h-4" />
         </button>
         <button
-          onClick={() => setAutoSkipCondiments(!autoSkipCondiments)}
+          onClick={() => setAutoAccept(!autoAccept)}
           className={`w-9 h-9 flex items-center justify-center rounded-lg border transition-colors ${
-            autoSkipCondiments
+            autoAccept
+              ? 'bg-purple-600 text-white border-purple-500'
+              : 'bg-[#111827] border-slate-800 text-slate-400 hover:border-slate-600'
+          }`}
+          title={autoAccept ? 'Auto-accept predictions: ON' : 'Auto-accept predictions: OFF'}
+        >
+          <Sparkles className="w-4 h-4" />
+        </button>
+        <button
+          onClick={() => setEntreesOnly(!entreesOnly)}
+          className={`w-9 h-9 flex items-center justify-center rounded-lg border transition-colors ${
+            entreesOnly
               ? 'bg-berkeley-gold text-berkeley-blue border-berkeley-gold'
               : 'bg-[#111827] border-slate-800 text-slate-400 hover:border-slate-600'
           }`}
-          title={autoSkipCondiments ? 'Auto-skip condiments: ON' : 'Auto-skip condiments: OFF'}
+          title={entreesOnly ? 'Entrees only: ON' : 'Entrees only: OFF'}
         >
           <Zap className="w-4 h-4" />
         </button>
@@ -530,6 +687,115 @@ function RatePageContent() {
         </div>
         <p className="text-xs text-slate-600 mt-1 text-right">{progressPercent}%</p>
       </div>
+
+      {/* Pending Auto-Accept Banner — user must click Apply */}
+      {pendingAutoAccept.length > 0 && (
+        <div className="bg-purple-900/20 rounded-lg border border-purple-500/30 p-4 mb-6">
+          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center gap-2">
+              <Sparkles className="w-4 h-4 text-purple-400" />
+              <span className="text-sm text-purple-200">
+                {pendingAutoAccept.length} dish{pendingAutoAccept.length !== 1 ? 'es' : ''} ready
+                {' '}({pendingAutoAccept.filter(i => i.rating > 0).length} rated, {pendingAutoAccept.filter(i => i.rating === -1).length} skipped)
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setShowAutoAcceptReview(!showAutoAcceptReview)}
+                className="text-xs text-purple-400 hover:text-purple-300 transition-colors"
+              >
+                {showAutoAcceptReview ? 'Hide' : 'Review'}
+              </button>
+              <button
+                onClick={applyPendingAutoAccept}
+                className="text-xs px-3 py-1 rounded bg-purple-600/40 text-purple-100 hover:bg-purple-600/60 font-medium transition-colors"
+              >
+                Apply All
+              </button>
+            </div>
+          </div>
+          {showAutoAcceptReview && (
+            <div className="max-h-64 overflow-y-auto space-y-1 mt-2">
+              {pendingAutoAccept.map((item) => (
+                <div key={item.name} className="flex items-center justify-between text-sm px-2 py-1.5 rounded bg-purple-900/20">
+                  <span className="text-purple-200 truncate mr-2 flex-1 min-w-0">{item.name}</span>
+                  <div className="flex items-center gap-1 shrink-0">
+                    {/* Quick rating buttons */}
+                    {[5, 6, 7, 8, 9, 10].map((n) => (
+                      <button
+                        key={n}
+                        onClick={() => setPendingAutoAccept((prev) =>
+                          prev.map((p) => p.name === item.name ? { ...p, rating: n } : p)
+                        )}
+                        className={`w-6 h-6 rounded text-xs font-medium transition-colors ${
+                          Math.round(item.rating) === n
+                            ? 'bg-purple-500 text-white'
+                            : 'bg-purple-900/30 text-purple-400/60 hover:text-purple-300'
+                        }`}
+                      >
+                        {n}
+                      </button>
+                    ))}
+                    {/* Skip toggle */}
+                    <button
+                      onClick={() => setPendingAutoAccept((prev) =>
+                        prev.map((p) => p.name === item.name
+                          ? { ...p, rating: p.rating === -1 ? 5 : -1 }
+                          : p
+                        )
+                      )}
+                      className={`px-1.5 h-6 rounded text-xs font-medium transition-colors ${
+                        item.rating === -1
+                          ? 'bg-red-600/40 text-red-200'
+                          : 'bg-red-900/20 text-red-400/60 hover:text-red-300'
+                      }`}
+                    >
+                      skip
+                    </button>
+                    {/* Remove from pending */}
+                    <button
+                      onClick={() => {
+                        undoneItemsRef.current.add(item.name);
+                        setPendingAutoAccept((prev) => prev.filter((p) => p.name !== item.name));
+                      }}
+                      className="w-6 h-6 rounded text-xs text-slate-600 hover:text-slate-300 transition-colors"
+                    >
+                      <X className="w-3 h-3 mx-auto" />
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Applied Auto-Accept Review — undo available */}
+      {autoAcceptedItems.length > 0 && (
+        <div className="bg-slate-800/30 rounded-lg border border-slate-700/50 p-3 mb-6">
+          <div className="flex items-center justify-between">
+            <span className="text-xs text-slate-400">
+              {autoAcceptedItems.length} auto-applied
+            </span>
+            <button
+              onClick={() => {
+                const newRankings = { ...rankings };
+                for (const item of autoAcceptedItems) {
+                  delete newRankings[item.name];
+                  undoneItemsRef.current.add(item.name);
+                }
+                setRankings(newRankings);
+                saveRankings(newRankings);
+                scheduleCloudSync();
+                setAutoAcceptedItems([]);
+              }}
+              className="text-xs px-2 py-1 rounded bg-slate-700/50 text-slate-300 hover:bg-slate-700 transition-colors"
+            >
+              Undo All
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Category Filters */}
       {showFilters && (
@@ -805,7 +1071,7 @@ function RatePageContent() {
             You&apos;ve rated all {ratedCount} dishes for this meal.
           </p>
           <Link
-            href="/"
+            href={`/?date=${dateParam}&meal=${mealParam}`}
             className="bg-berkeley-gold text-berkeley-blue font-semibold px-6 py-3 rounded-lg hover:bg-berkeley-lightgold transition-colors inline-block"
           >
             See Recommendations

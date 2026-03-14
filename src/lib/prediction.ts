@@ -1,4 +1,5 @@
-import { Rankings, Prediction } from './types';
+import { Rankings, Prediction, CategoryPreferences } from './types';
+import { ONBOARDING_GROUPS, PREFERENCE_TO_RATING, PREFERENCE_CONFIDENCE, getGroupWeight, getOnboardingGroupForTaxonomy } from './onboarding';
 
 // ─── Food Taxonomy ──────────────────────────────────────────────────────────
 // Broad groups mapping specific food words to taxonomy categories.
@@ -468,15 +469,87 @@ function buildPrediction(
   };
 }
 
+/**
+ * Predict a dish rating from category-level preferences (onboarding).
+ * Maps dish tokens → taxonomy groups → onboarding groups → user preferences.
+ */
+export function predictFromCategories(
+  dishName: string,
+  categoryPreferences: CategoryPreferences
+): Prediction | null {
+  if (Object.keys(categoryPreferences).length === 0) return null;
+
+  const tokens = tokenize(dishName);
+  if (tokens.length === 0) return null;
+
+  const groups = getTaxonomyGroups(tokens);
+  if (groups.size === 0) return null;
+
+  // Map taxonomy groups → onboarding group display names → user preferences
+  let totalWeight = 0;
+  let weightedSum = 0;
+  let hasSkip = false;
+  let matchCount = 0;
+  let maxBaseConfidence = 0;
+  const matchedGroups: string[] = [];
+
+  for (const taxonomyKey of Array.from(groups)) {
+    const groupName = getOnboardingGroupForTaxonomy(taxonomyKey);
+    if (!groupName || !(groupName in categoryPreferences)) continue;
+
+    const pref = categoryPreferences[groupName];
+    const rating = PREFERENCE_TO_RATING[pref];
+    const weight = getGroupWeight(taxonomyKey);
+    const baseConf = PREFERENCE_CONFIDENCE[pref];
+
+    if (pref === 'skip') {
+      hasSkip = true;
+    }
+
+    totalWeight += weight;
+    weightedSum += weight * rating;
+    matchCount++;
+    if (baseConf > maxBaseConfidence) maxBaseConfidence = baseConf;
+    if (!matchedGroups.includes(groupName)) matchedGroups.push(groupName);
+  }
+
+  if (matchCount === 0) return null;
+
+  const avgRating = weightedSum / totalWeight;
+  const predictedSkip = hasSkip && (matchCount === 1 || avgRating < 0);
+  // Scale confidence by preference strength; multi-match adds +0.05 per extra match (cap 0.85)
+  const confidence = matchCount >= 2
+    ? Math.min(maxBaseConfidence + 0.05 * (matchCount - 1), 0.85)
+    : maxBaseConfidence;
+
+  return {
+    rating: predictedSkip ? -1 : Math.max(1, Math.round(avgRating * 2) / 2),
+    confidence,
+    similarDishes: matchedGroups.slice(0, 3).map((g) => ({
+      name: g,
+      rating: PREFERENCE_TO_RATING[categoryPreferences[g]],
+      similarity: confidence,
+    })),
+    predictedSkip,
+  };
+}
+
 export function predict(
   dish: DishContext,
   rankings: Rankings,
   allDishNames: string[],
-  dishCategories?: Record<string, string>
+  dishCategories?: Record<string, string>,
+  categoryPreferences?: CategoryPreferences
 ): Prediction | null {
   // Include both positive ratings AND skips (-1) as neighbors
   const ratedDishes = Object.entries(rankings).filter(([, r]) => r > 0 || r === -1);
-  if (ratedDishes.length === 0) return null;
+  if (ratedDishes.length === 0) {
+    // No dish-level ratings — try category fallback
+    if (categoryPreferences && Object.keys(categoryPreferences).length > 0) {
+      return predictFromCategories(dish.name, categoryPreferences);
+    }
+    return null;
+  }
 
   const idf = computeIDF(allDishNames);
   const targetTokens = tokenize(dish.name);
@@ -505,16 +578,36 @@ export function predict(
   const catSkipRatios = getCategorySkipRatios(rankings, dishCategories);
   const catRatio = dish.category ? (catSkipRatios.get(dish.category.toLowerCase()) || 0) : 0;
 
-  return buildPrediction(scored, catRatio);
+  const result = buildPrediction(scored, catRatio);
+
+  // Fallback to category-level prediction if dish-level prediction is weak/absent
+  if ((!result || result.confidence < 0.5) && categoryPreferences && Object.keys(categoryPreferences).length > 0) {
+    const catPred = predictFromCategories(dish.name, categoryPreferences);
+    if (catPred) return catPred;
+  }
+
+  return result;
 }
 
 export function predictAll(
   dishes: DishContext[],
   rankings: Rankings,
-  dishCategories?: Record<string, string>
+  dishCategories?: Record<string, string>,
+  categoryPreferences?: CategoryPreferences
 ): Map<string, Prediction> {
   const ratedDishes = Object.entries(rankings).filter(([, r]) => r > 0 || r === -1);
-  if (ratedDishes.length === 0) return new Map();
+  if (ratedDishes.length === 0) {
+    // No dish-level ratings — try category fallback for all dishes
+    if (categoryPreferences && Object.keys(categoryPreferences).length > 0) {
+      const results = new Map<string, Prediction>();
+      for (const dish of dishes) {
+        const catPred = predictFromCategories(dish.name, categoryPreferences);
+        if (catPred) results.set(dish.name, catPred);
+      }
+      return results;
+    }
+    return new Map();
+  }
 
   // Build IDF from all known dish names
   const allNames = [
@@ -560,10 +653,62 @@ export function predictAll(
 
     const catRatio = dish.category ? (catSkipRatios.get(dish.category.toLowerCase()) || 0) : 0;
     const pred = buildPrediction(scored, catRatio);
-    if (pred) {
+
+    if (pred && (pred.confidence >= 0.5 || !categoryPreferences || Object.keys(categoryPreferences).length === 0)) {
+      results.set(dish.name, pred);
+    } else if (categoryPreferences && Object.keys(categoryPreferences).length > 0) {
+      // Fallback to category-level prediction
+      const catPred = predictFromCategories(dish.name, categoryPreferences);
+      if (catPred) {
+        results.set(dish.name, catPred);
+      } else if (pred) {
+        results.set(dish.name, pred);
+      }
+    } else if (pred) {
       results.set(dish.name, pred);
     }
   }
 
   return results;
+}
+
+// ─── Dish Usefulness Scoring ────────────────────────────────────────────────
+// Ranks unrated dishes by how much new prediction signal rating them would add.
+// Prioritizes dishes with food-type keywords not yet covered by existing ratings.
+
+export function scoreDishUsefulness(
+  dishName: string,
+  rankings: Rankings,
+  hallCount: number
+): number {
+  const tokens = tokenize(dishName);
+  if (tokens.length === 0) return 0;
+
+  // Collect food-type tokens already covered by rated dishes
+  const coveredTokens = new Set<string>();
+  for (const ratedName of Object.keys(rankings)) {
+    for (const t of tokenize(ratedName)) {
+      if (FOOD_TYPE_WORDS.has(t)) coveredTokens.add(t);
+    }
+  }
+
+  // Score: count uncovered food-type tokens in this dish
+  let uncoveredFoodTypes = 0;
+  let totalFoodTypes = 0;
+  for (const t of tokens) {
+    if (FOOD_TYPE_WORDS.has(t)) {
+      totalFoodTypes++;
+      if (!coveredTokens.has(t)) uncoveredFoodTypes++;
+    }
+  }
+
+  // Dishes with food-type words are more useful than generic ones
+  const foodTypeScore = totalFoodTypes > 0 ? 1 : 0;
+  // Uncovered tokens are the main signal
+  const noveltyScore = uncoveredFoodTypes;
+  // Appearing at multiple halls means the rating impacts more scores
+  const hallBonus = Math.min(hallCount, 4) / 4;
+
+  // Combine: novelty is most important, then having food types at all, then hall coverage
+  return noveltyScore * 3 + foodTypeScore * 1 + hallBonus * 0.5;
 }
