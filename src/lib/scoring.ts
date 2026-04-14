@@ -1,12 +1,31 @@
-import { MenuItem, Rankings, StationScoreResult, HallScoreResult, MenuData } from './types';
+import { MenuItem, Rankings, StationScoreResult, HallScoreResult, MenuData, MealSize } from './types';
+
+// Diminishing weights for top-N items (index 0 = best item)
+const MEAL_WEIGHTS = [1.0, 0.7, 0.5, 0.3];
+
+/**
+ * Weighted average of `values` using MEAL_WEIGHTS (truncated to length).
+ */
+function weightedAvg(values: number[]): number {
+  if (values.length === 0) return 0;
+  let sumW = 0;
+  let sumWV = 0;
+  for (let i = 0; i < values.length; i++) {
+    const w = MEAL_WEIGHTS[i] ?? MEAL_WEIGHTS[MEAL_WEIGHTS.length - 1];
+    sumW += w;
+    sumWV += w * values[i];
+  }
+  return sumWV / sumW;
+}
 
 /**
  * Calculates score for a specific station (list of items).
- * Exact port of Python's calculate_station_score.
+ * Uses weighted top-N entrees where N = mealSize.
  */
 export function calculateStationScore(
   items: MenuItem[],
-  rankings: Rankings
+  rankings: Rankings,
+  mealSize: MealSize = 2
 ): Omit<StationScoreResult, 'name'> {
   let riceItem: { item: MenuItem; rating: number } | null = null;
   const entrees: { item: MenuItem; rating: number }[] = [];
@@ -16,7 +35,7 @@ export function calculateStationScore(
     const rating = rankings[item.name];
     if (rating < 0) continue; // skipped dish — won't eat
 
-    if (item.name.toLowerCase().includes('rice')) {
+    if (/\brice\b/.test(item.name.toLowerCase())) {
       if (riceItem === null || rating > riceItem.rating) {
         riceItem = { item, rating };
       }
@@ -28,37 +47,24 @@ export function calculateStationScore(
   // Sort entrees by rating descending
   entrees.sort((a, b) => b.rating - a.rating);
 
-  // Take top 2 entrees
-  const topEntrees = entrees.slice(0, 2);
+  // Take top N entrees (N = mealSize)
+  const topEntrees = entrees.slice(0, mealSize);
 
   if (topEntrees.length === 0) {
     return { score: 0, details: [], entree_avg: 0, rice_bonus: 0 };
   }
 
-  const entree1 = topEntrees[0];
-  const entree2 = topEntrees.length > 1 ? topEntrees[1] : null;
-
-  // Conditional Entree Averaging
-  // If Entree 2 exists and is >= 8, average them. Otherwise just use Entree 1.
-  let avgEntreeScore: number;
-  let usedEntrees: { item: MenuItem; rating: number }[];
-
-  if (entree2 && entree2.rating >= 8) {
-    avgEntreeScore = (entree1.rating + entree2.rating) / 2;
-    usedEntrees = [entree1, entree2];
-  } else {
-    avgEntreeScore = entree1.rating;
-    usedEntrees = [entree1];
-  }
+  // Weighted average of top entrees using diminishing weights
+  const avgEntreeScore = weightedAvg(topEntrees.map(e => e.rating));
 
   let riceBonus = 0;
   if (riceItem) {
     riceBonus = 0.1 * riceItem.rating;
   }
 
-  let totalScore = avgEntreeScore + riceBonus;
+  const totalScore = Math.min(avgEntreeScore + riceBonus, 10);
 
-  const details = usedEntrees.map((e) => e.item);
+  const details = topEntrees.map((e) => e.item);
   if (riceItem) {
     details.push(riceItem.item);
   }
@@ -73,14 +79,15 @@ export function calculateStationScore(
 
 /**
  * Calculates overall score for a dining hall for a specific meal period.
- * Exact port of Python's calculate_hall_score.
+ * Uses weighted top-N stations where N = mealSize.
  */
 export function calculateHallScore(
   menu: MenuData,
   rankings: Rankings,
   mealPeriod: string,
   ignoredCategories: Set<string> = new Set(),
-  excludeItems: Set<string> = new Set()
+  excludeItems: Set<string> = new Set(),
+  mealSize: MealSize = 2
 ): HallScoreResult {
   if (!(mealPeriod in menu.meals)) {
     return { total_score: 0, stations: [] };
@@ -106,7 +113,7 @@ export function calculateHallScore(
   // Calculate score for each station
   const stationScores: StationScoreResult[] = [];
   for (const [stationName, stationItems] of Object.entries(stations)) {
-    const res = calculateStationScore(stationItems, rankings);
+    const res = calculateStationScore(stationItems, rankings, mealSize);
     if (res.score > 0) {
       stationScores.push({ ...res, name: stationName });
     }
@@ -119,17 +126,12 @@ export function calculateHallScore(
     return { total_score: 0, stations: [] };
   }
 
-  const stn1 = stationScores[0];
-  const stn2 = stationScores.length > 1 ? stationScores[1] : null;
+  // Consider up to mealSize stations — a grazer visits more stations
+  const stationCount = Math.min(mealSize, stationScores.length);
+  const chosenStations = stationScores.slice(0, stationCount);
 
-  let finalScore = stn1.score;
-  const chosenStations: StationScoreResult[] = [stn1];
-
-  // Combine Logic: if 2nd station >= 8, average + 1 variety bonus
-  if (stn2 && stn2.score >= 8) {
-    finalScore = (stn1.score + stn2.score) / 2 + 1;
-    chosenStations.push(stn2);
-  }
+  // Weighted average of chosen station scores (no variety bonus)
+  const finalScore = weightedAvg(chosenStations.map(s => s.score));
 
   return {
     total_score: finalScore,

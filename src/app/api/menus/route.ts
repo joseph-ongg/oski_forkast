@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { XMLParser } from 'fast-xml-parser';
 import { MenuItem, MenuData } from '@/lib/types';
+import { classifyDish } from '@/lib/headliner';
 
 const BASE_URL = 'https://dining.berkeley.edu/wp-content/uploads/menus-exportimport/';
 
@@ -72,6 +73,10 @@ function parseMenu(xmlContent: string, locationName: string, dateStr: string): M
         const dietaryChoices = parseDietaryChoices(recipe.dietaryChoices);
 
         items.push({ name, category, description, allergens, dietaryChoices });
+      }
+
+      for (const item of items) {
+        item.dishType = classifyDish(item).dishType;
       }
 
       menuData.meals[mealPeriod] = items;

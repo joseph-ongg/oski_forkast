@@ -1,9 +1,12 @@
+export type DishType = 'entree' | 'side' | 'sauce' | 'condiment' | 'dessert' | 'beverage';
+
 export interface MenuItem {
   name: string;
   category: string;
   description: string;
   allergens: string[];
   dietaryChoices: string[];
+  dishType?: DishType;
 }
 
 export interface DietaryPreferences {
@@ -47,6 +50,10 @@ export type HallDistances = Record<string, number>;
 
 export type CategoryPreferenceLevel = 'love' | 'good' | 'fine' | 'meh' | 'skip';
 export type CategoryPreferences = Record<string, CategoryPreferenceLevel>;
+
+// How many dishes the user typically grabs per meal (controls scoring depth)
+// 1 = one main, 2 = main + side, 3 = main + side + rice, 4 = full plate
+export type MealSize = 1 | 2 | 3 | 4;
 
 export interface Prediction {
   rating: number; // -1 means predicted skip

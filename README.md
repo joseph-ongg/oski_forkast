@@ -17,7 +17,7 @@ Find the best UC Berkeley dining hall for every meal. Rate dishes you've tried, 
 - **Smart predictions** — unrated dishes get predicted ratings based on similar foods you've rated
 - **Auto meal detection** — shows the right meal period based on time of day (including weekend brunch)
 - **Dietary filters** — vegan, vegetarian, halal diet filters plus allergen exclusion
-- **Walk time distance** — set your dorm and closer halls get a score boost (presets for Unit 1-3, Foothill, Clark Kerr)
+- **Walk time distance** — set your dorm and closer halls get a score boost (presets for Unit 1–3, Foothill, Clark Kerr)
 - **Baseline score** — set a minimum score threshold; if no hall meets it, we suggest a cafe instead
 - **3-day planner** — plan ahead by seeing recommendations for upcoming meals
 - **Score breakdown** — see exactly which stations and dishes are driving each hall's score

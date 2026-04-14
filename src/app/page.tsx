@@ -2,9 +2,9 @@
 
 import { Suspense, useState, useEffect, useCallback, useMemo } from 'react';
 import { useAuth } from './providers';
-import { MenuData, Rankings, HallResult, DietaryPreferences, HallDistances } from '@/lib/types';
+import { MenuData, Rankings, HallResult, DietaryPreferences, HallDistances, MealSize } from '@/lib/types';
 import { calculateHallScore, getCurrentMealPeriod, resolveActivePeriod, getEarlierMealItems } from '@/lib/scoring';
-import { loadRankings, loadIgnoredCategories, loadDietaryPreferences, loadHallDistances, loadBaselineScore, isOnboardingComplete } from '@/lib/storage';
+import { loadRankings, loadIgnoredCategories, loadDietaryPreferences, loadHallDistances, loadBaselineScore, loadMealSize, isOnboardingComplete } from '@/lib/storage';
 import { getExcludedDishNames, shouldExcludeDish } from '@/lib/dietary';
 import { syncWithCloud } from '@/lib/sync';
 import UserMenu from '@/components/UserMenu';
@@ -76,13 +76,6 @@ function getMealPeriodsForDate(dateStr: string): string[] {
   return isWeekend ? ['Brunch', 'Dinner'] : ['Breakfast', 'Lunch', 'Dinner'];
 }
 
-function getMealPeriodsForDateStr(dateStr: string): string[] {
-  const date = parseDate(dateStr);
-  const day = date.getDay();
-  const isWeekend = day === 0 || day === 6;
-  return isWeekend ? ['Brunch', 'Dinner'] : ['Breakfast', 'Lunch', 'Dinner'];
-}
-
 interface DayPlan {
   dateStr: string;
   mealPeriod: string;
@@ -99,7 +92,8 @@ function computeResults(
   mealPeriod: string,
   ignoredCategories: string[],
   dietaryPrefs?: DietaryPreferences,
-  hallDistances?: HallDistances
+  hallDistances?: HallDistances,
+  mealSize: MealSize = 2
 ): HallResult[] {
   const ignored = new Set(ignoredCategories.map((c) => c.toLowerCase()));
   const results: HallResult[] = [];
@@ -114,7 +108,7 @@ function computeResults(
       const dietaryExcluded = getExcludedDishNames(mealItems, dietaryPrefs);
       dietaryExcluded.forEach((name) => excludeItems.add(name));
     }
-    const score = calculateHallScore(menu, rankings, activePeriod, ignored, excludeItems);
+    const score = calculateHallScore(menu, rankings, activePeriod, ignored, excludeItems, mealSize);
     // Apply distance penalty if set
     if (hallDistances && hallDistances[menu.location] != null && score.total_score > 0) {
       const penalty = hallDistances[menu.location] * DISTANCE_PENALTY_PER_MIN;
@@ -164,6 +158,7 @@ function DashboardContent() {
   const [dietaryPrefs, setDietaryPrefs] = useState<DietaryPreferences>({ diets: [], allergens: [] });
   const [hallDistances, setHallDistances] = useState<HallDistances>({});
   const [baselineScore, setBaselineScore] = useState<number | null>(null);
+  const [mealSize, setMealSize] = useState<MealSize>(2);
   const [showPlanner, setShowPlanner] = useState(false);
   const [plannerData, setPlannerData] = useState<DayPlan[]>([]);
   const [plannerLoading, setPlannerLoading] = useState(false);
@@ -193,6 +188,7 @@ function DashboardContent() {
       setDietaryPrefs(loadDietaryPreferences());
       setHallDistances(loadHallDistances());
       setBaselineScore(loadBaselineScore());
+      setMealSize(loadMealSize());
       // Redirect first-time users to onboarding
       if (Object.keys(r).length === 0 && !isOnboardingComplete()) {
         router.push('/onboard');
@@ -212,7 +208,7 @@ function DashboardContent() {
   useEffect(() => {
     fetchMenus(dateStr);
     // Auto-switch meal period if current one isn't valid for this date
-    const validPeriods = getMealPeriodsForDateStr(dateStr);
+    const validPeriods = getMealPeriodsForDate(dateStr);
     if (!validPeriods.includes(mealPeriod)) {
       setMealPeriod(validPeriods[0]);
     }
@@ -223,8 +219,8 @@ function DashboardContent() {
       setHallResults([]);
       return;
     }
-    setHallResults(computeResults(menus, rankings, mealPeriod, ignoredCategories, dietaryPrefs, hallDistances));
-  }, [menus, rankings, mealPeriod, ignoredCategories, dietaryPrefs, hallDistances]);
+    setHallResults(computeResults(menus, rankings, mealPeriod, ignoredCategories, dietaryPrefs, hallDistances, mealSize));
+  }, [menus, rankings, mealPeriod, ignoredCategories, dietaryPrefs, hallDistances, mealSize]);
 
   useEffect(() => {
     const onStorage = () => {
@@ -233,6 +229,7 @@ function DashboardContent() {
       setDietaryPrefs(loadDietaryPreferences());
       setHallDistances(loadHallDistances());
       setBaselineScore(loadBaselineScore());
+      setMealSize(loadMealSize());
     };
     window.addEventListener('storage', onStorage);
     const onFocus = () => {
@@ -241,6 +238,7 @@ function DashboardContent() {
       setDietaryPrefs(loadDietaryPreferences());
       setHallDistances(loadHallDistances());
       setBaselineScore(loadBaselineScore());
+      setMealSize(loadMealSize());
     };
     window.addEventListener('focus', onFocus);
     return () => {
@@ -285,10 +283,11 @@ function DashboardContent() {
     const currentIgnored = loadIgnoredCategories();
     const currentDietary = loadDietaryPreferences();
     const currentDistances = loadHallDistances();
+    const currentMealSize = loadMealSize();
 
     const updatedDays = days.map((day) => {
       const dayMenus = menuCache[day.dateStr] || [];
-      const results = computeResults(dayMenus, currentRankings, day.mealPeriod, currentIgnored, currentDietary, currentDistances);
+      const results = computeResults(dayMenus, currentRankings, day.mealPeriod, currentIgnored, currentDietary, currentDistances, currentMealSize);
       return { ...day, results, loading: false };
     });
 
@@ -393,7 +392,7 @@ function DashboardContent() {
 
       {/* Meal Period Tabs */}
       <div className="flex gap-1 mb-4 bg-[#111827] rounded-lg p-1">
-        {getMealPeriodsForDateStr(dateStr).map((mp) => (
+        {getMealPeriodsForDate(dateStr).map((mp) => (
           <button
             key={mp}
             onClick={() => setMealPeriod(mp)}
@@ -651,7 +650,9 @@ function DashboardContent() {
                         {stn.rice_bonus > 0 && ` + Rice: ${stn.rice_bonus.toFixed(1)}`}
                       </div>
                       <div className="flex flex-wrap gap-1 mt-1">
-                        {stn.details.map((item) => (
+                        {stn.details
+                          .filter((item) => item.dishType === 'entree')
+                          .map((item) => (
                           <span
                             key={item.name}
                             className="text-xs bg-[#1a2035] text-slate-400 px-2 py-0.5 rounded"

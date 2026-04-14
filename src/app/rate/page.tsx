@@ -14,15 +14,18 @@ import {
   loadCategoryPreferences,
   loadAutoAccept,
   saveAutoAccept,
-  loadEntreesOnly,
-  saveEntreesOnly,
+  loadHeadlinersOnly,
+  saveHeadlinersOnly,
+  loadPreciseMode,
+  savePreciseMode,
   loadVeganMeatPref,
 } from '@/lib/storage';
 import { CategoryPreferences } from '@/lib/types';
 import { shouldExcludeDish } from '@/lib/dietary';
 import { pushToCloud, syncWithCloud } from '@/lib/sync';
+import { filterToHeadliners, classifyDish } from '@/lib/headliner';
 import Link from 'next/link';
-import { ArrowLeft, SkipForward, Check, Star, Filter, X, ChevronLeft, Layers, CalendarRange, Sparkles, Search, Zap, Shield } from 'lucide-react';
+import { ArrowLeft, SkipForward, Check, Star, Filter, X, ChevronLeft, Layers, CalendarRange, Sparkles, Search, Zap, Shield, SlidersHorizontal } from 'lucide-react';
 import { predict, predictAll, tokenize, scoreDishUsefulness } from '@/lib/prediction';
 import { Prediction } from '@/lib/types';
 import { useSearchParams } from 'next/navigation';
@@ -40,6 +43,29 @@ interface UniqueItem {
   categories: string[];
   allergens: string[];
   dietaryChoices: string[];
+}
+
+// ─── 5-Button Rating Config ────────────────────────────────────────────────
+
+const RATING_BUTTONS = [
+  { label: 'Love', emoji: '\u2B50', value: 10, defaultBg: 'bg-berkeley-gold/20', activeBg: 'bg-berkeley-gold text-berkeley-blue', activeRing: 'ring-berkeley-gold/50' },
+  { label: 'Good', emoji: '\uD83D\uDC4D', value: 8, defaultBg: 'bg-blue-600/20', activeBg: 'bg-blue-600 text-white', activeRing: 'ring-blue-500/50' },
+  { label: 'Fine', emoji: '\uD83D\uDE10', value: 6, defaultBg: 'bg-slate-700/50', activeBg: 'bg-slate-600 text-white', activeRing: 'ring-slate-500/50' },
+  { label: 'Meh', emoji: '\uD83D\uDE15', value: 4, defaultBg: 'bg-orange-600/20', activeBg: 'bg-orange-700 text-white', activeRing: 'ring-orange-600/50' },
+  { label: 'Skip', emoji: '\u274C', value: -1, defaultBg: 'bg-red-600/20', activeBg: 'bg-red-700 text-white', activeRing: 'ring-red-600/50' },
+] as const;
+
+function ratingToBucket(rating: number): number {
+  if (rating === -1) return -1;
+  if (rating >= 9) return 10;    // Love
+  if (rating >= 7) return 8;     // Good
+  if (rating >= 5) return 6;     // Fine
+  return 4;                      // Meh
+}
+
+function predictionToBucket(pred: Prediction): typeof RATING_BUTTONS[number] | null {
+  if (pred.predictedSkip) return RATING_BUTTONS[4]; // Skip
+  return RATING_BUTTONS.find(b => b.value === ratingToBucket(pred.rating)) || null;
 }
 
 export default function RatePage() {
@@ -60,7 +86,6 @@ function RatePageContent() {
   const [rankings, setRankings] = useState<Rankings>({});
   const [loading, setLoading] = useState(true);
   const [currentIndex, setCurrentIndex] = useState(0);
-  const [ratingInput, setRatingInput] = useState('');
   const [showFilters, setShowFilters] = useState(false);
   const [ignoredCategories, setIgnoredCategories] = useState<string[]>([]);
   const [rateAll, setRateAll] = useState(false);
@@ -68,10 +93,10 @@ function RatePageContent() {
   const [weekMenus, setWeekMenus] = useState<MenuData[]>([]);
   const [weekLoading, setWeekLoading] = useState(false);
   const [history, setHistory] = useState<{ name: string; rating: number }[]>([]);
-  const [lastAction, setLastAction] = useState<number | null>(null); // rating shown after going back
   const [searchQuery, setSearchQuery] = useState('');
   const [searchOpen, setSearchOpen] = useState(false);
-  const [entreesOnly, setEntreesOnlyState] = useState(false);
+  const [headlinersOnly, setHeadlinersOnlyState] = useState(false);
+  const [preciseMode, setPreciseModeState] = useState(false);
   const [showDietary, setShowDietary] = useState(false);
   const [dietaryPrefs, setDietaryPrefs] = useState<DietaryPreferences>({ diets: [], allergens: [] });
   const [categoryPrefs, setCategoryPrefs] = useState<CategoryPreferences>({});
@@ -82,6 +107,7 @@ function RatePageContent() {
   const [pendingAutoAccept, setPendingAutoAccept] = useState<{ name: string; rating: number }[]>([]);
   const [autoAcceptedItems, setAutoAcceptedItems] = useState<{ name: string; rating: number }[]>([]);
   const [showAutoAcceptReview, setShowAutoAcceptReview] = useState(false);
+  const [ratingInput, setRatingInput] = useState('');
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const syncTimer = useRef<NodeJS.Timeout | null>(null);
   const undoneItemsRef = useRef<Set<string>>(new Set());
@@ -97,12 +123,17 @@ function RatePageContent() {
     }
   }, []);
 
-  const setEntreesOnly = useCallback((val: boolean) => {
-    setEntreesOnlyState(val);
-    saveEntreesOnly(val);
+  const setHeadlinersOnly = useCallback((val: boolean) => {
+    setHeadlinersOnlyState(val);
+    saveHeadlinersOnly(val);
   }, []);
 
-  // Debounced cloud sync — pushes to cloud 2s after last rating action
+  const setPreciseMode = useCallback((val: boolean) => {
+    setPreciseModeState(val);
+    savePreciseMode(val);
+  }, []);
+
+  // Debounced cloud sync
   const scheduleCloudSync = useCallback(() => {
     if (!user) return;
     if (syncTimer.current) clearTimeout(syncTimer.current);
@@ -116,7 +147,8 @@ function RatePageContent() {
       setDietaryPrefs(loadDietaryPreferences());
       setCategoryPrefs(loadCategoryPreferences());
       setAutoAcceptState(loadAutoAccept());
-      setEntreesOnlyState(loadEntreesOnly());
+      setHeadlinersOnlyState(loadHeadlinersOnly());
+      setPreciseModeState(loadPreciseMode());
       setVeganMeatPref(loadVeganMeatPref());
     };
     if (user) {
@@ -180,8 +212,7 @@ function RatePageContent() {
     setWeekLoading(false);
   }, []);
 
-  // Collect all unique items — either current meal, all meals, or full week
-  // Collect all allergens and dietary labels seen in current menus
+  // Collect all unique items
   const { allAllergens, allDiets } = useMemo(() => {
     const allergenSet = new Set<string>();
     const dietSet = new Set<string>();
@@ -217,7 +248,6 @@ function RatePageContent() {
         if (!existing.categories.includes(item.category)) {
           existing.categories.push(item.category);
         }
-        // Merge allergens/dietary — union of all occurrences
         for (const a of item.allergens) {
           if (!existing.allergens.includes(a)) existing.allergens.push(a);
         }
@@ -257,88 +287,43 @@ function RatePageContent() {
     };
   }, [menus, weekMenus, mealParam, ignoredCategories, rateAll, rateWeek, dietaryPrefs]);
 
-  // Non-entree detection using category (station) + name patterns.
-  // Category is the primary signal — way more reliable than parsing dish names.
-  const isNonEntree = useCallback((item: UniqueItem): boolean => {
-    const catLower = item.categories.map(c => c.toLowerCase());
-
-    // Categories that are NEVER entrees — skip everything from these
-    const JUNK_CATEGORIES = [
-      'condiment', 'beverage', 'cereal', 'bakery', 'bread',
-      'salad bar', 'deli bar', 'fruit', 'topping',
-    ];
-    if (catLower.some(c => JUNK_CATEGORIES.some(j => c.includes(j)))) return true;
-
-    // Name-based patterns that are never entrees regardless of station
-    const lower = item.name.toLowerCase();
-
-    // Prep patterns: "Sliced X", "Diced X", etc.
-    if (/^(sliced|diced|shredded|chopped|fresh|raw|whole|dried)\s/.test(lower)) return true;
-
-    // Dressings, vinaigrettes, sauces (standalone)
-    if (/dressing|vinaigrette|vinegar|aioli|mayo|gravy|syrup|jelly|jam\b/.test(lower)) return true;
-
-    // Single ingredients that aren't dishes (1-2 tokens)
-    const tokens = tokenize(item.name);
-    if (tokens.length <= 2) {
-      const INGREDIENT_WORDS = new Set([
-        'tomato', 'tomatoes', 'cucumber', 'cucumbers', 'lettuce', 'spinach',
-        'arugula', 'kale', 'cabbage', 'radish', 'radishes', 'beet', 'beets',
-        'carrot', 'carrots', 'celery', 'onion', 'onions', 'peppers',
-        'olives', 'pickles', 'jalapenos', 'mushrooms',
-        'raisins', 'cranberries', 'croutons',
-        'apple', 'apples', 'banana', 'bananas', 'orange', 'oranges',
-        'melon', 'grapes', 'berries', 'strawberries', 'blueberries',
-        'pineapple', 'mango', 'peach', 'pear', 'plum', 'kiwi',
-        'salt', 'pepper', 'ketchup', 'mustard', 'relish', 'salsa',
-        'butter', 'margarine', 'cream', 'sour', 'whipped',
-        'cheese', 'cheddar', 'mozzarella', 'parmesan', 'provolone', 'swiss',
-        'feta', 'gouda', 'brie', 'ricotta', 'queso',
-        'ranch', 'hummus', 'guacamole', 'pesto', 'tahini', 'tzatziki',
-        'honey', 'sugar', 'cinnamon', 'nutmeg',
-        'oil', 'olive', 'lemon', 'lime', 'garlic', 'ginger',
-        'basil', 'cilantro', 'parsley', 'mint', 'dill', 'chives',
-        'oregano', 'thyme', 'rosemary', 'sage',
-        'almonds', 'walnuts', 'pecans', 'cashews', 'peanuts',
-        'granola', 'oatmeal', 'yogurt',
-        'chips', 'crackers', 'tortilla',
-        'broth', 'stock', 'milk', 'juice', 'water', 'coffee', 'tea',
-        'sprouts', 'sprinkles',
-      ]);
-      if (tokens.every(t => INGREDIENT_WORDS.has(t))) return true;
-    }
-
-    return false;
-  }, []);
+  // Filter to headliners when toggle is on (client-side classification)
+  const filteredItems = useMemo(() => {
+    if (!headlinersOnly) return allItems;
+    // Convert UniqueItems to MenuItems for headliner classification
+    const asMenuItems: MenuItem[] = allItems.map(item => ({
+      name: item.name,
+      category: item.categories[0] || '',
+      description: item.description,
+      allergens: item.allergens,
+      dietaryChoices: item.dietaryChoices,
+    }));
+    const headliners = filterToHeadliners(asMenuItems);
+    const headlinerNames = new Set(headliners.map(h => h.name));
+    return allItems.filter(item => headlinerNames.has(item.name));
+  }, [allItems, headlinersOnly]);
 
   // Unrated items, sorted by station then by keyword similarity within each station.
-  // When entreesOnly is on, non-entree items are filtered out (not marked -1).
   const unratedItems = useMemo(() => {
-    let unrated = allItems.filter((item) => !(item.name in rankings));
-    if (entreesOnly) {
-      unrated = unrated.filter((item) => !isNonEntree(item));
-    }
+    const unrated = filteredItems.filter((item) => !(item.name in rankings));
     return unrated.sort((a, b) => {
-      // Primary: group by station (first category alphabetically)
       const catA = (a.categories[0] || '').toLowerCase();
       const catB = (b.categories[0] || '').toLowerCase();
       if (catA !== catB) return catA.localeCompare(catB);
-      // Secondary: sort by shared keywords (items with similar names cluster together)
       const tokensA = tokenize(a.name);
       const tokensB = tokenize(b.name);
-      // Use first keyword as sub-group, then full name
       const keyA = tokensA[0] || '';
       const keyB = tokensB[0] || '';
       if (keyA !== keyB) return keyA.localeCompare(keyB);
       return a.name.localeCompare(b.name);
     });
-  }, [allItems, rankings, entreesOnly, isNonEntree]);
+  }, [filteredItems, rankings]);
 
   const currentItem = unratedItems[currentIndex] || null;
   const totalUnrated = unratedItems.length;
-  const displayItems = entreesOnly ? allItems.filter((item) => !isNonEntree(item)) : allItems;
-  const totalItems = displayItems.length;
-  const ratedCount = displayItems.filter((item) => item.name in rankings).length;
+  const totalItems = filteredItems.length;
+  const ratedCount = filteredItems.filter((item) => item.name in rankings).length;
+  const totalAllItems = allItems.length;
 
   // Predict rating for current dish
   const currentPrediction: Prediction | null = useMemo(() => {
@@ -386,7 +371,7 @@ function RatePageContent() {
     }
   }, [veganMeatPref, unratedItems, loading, weekLoading]);
 
-  // Auto-accept: collect pending predictions (don't apply instantly)
+  // Auto-accept: collect pending predictions
   useEffect(() => {
     if (!autoAccept || loading || weekLoading) return;
     if (unratedItems.length === 0) { setPendingAutoAccept([]); return; }
@@ -409,7 +394,6 @@ function RatePageContent() {
 
     for (const [name, pred] of Array.from(predictions.entries())) {
       if (undoneItemsRef.current.has(name)) continue;
-      // Require at least 3 similar dishes backing the prediction
       if (pred.similarDishes.length < 3) continue;
       if (pred.predictedSkip && pred.confidence >= 0.70) {
         pending.push({ name, rating: -1 });
@@ -421,7 +405,6 @@ function RatePageContent() {
     setPendingAutoAccept(pending);
   }, [autoAccept, unratedItems, loading, weekLoading, allItems, rankings, categoryPrefs]);
 
-  // Apply all pending auto-accept predictions
   const applyPendingAutoAccept = useCallback(() => {
     if (pendingAutoAccept.length === 0) return;
     const newRankings = { ...rankings };
@@ -451,7 +434,6 @@ function RatePageContent() {
     [searchResults, rankings]
   );
 
-  // Predictions for unrated search results
   const searchPredictions = useMemo(() => {
     const preds = new Map<string, Prediction>();
     if (!searchQuery.trim()) return preds;
@@ -473,7 +455,6 @@ function RatePageContent() {
     return preds;
   }, [searchQuery, unratedSearchResults, rankings, allItems, categoryPrefs]);
 
-  // Mass skip all unrated search results
   const handleMassSkip = useCallback(() => {
     if (unratedSearchResults.length === 0) return;
     const newRankings = { ...rankings };
@@ -487,7 +468,6 @@ function RatePageContent() {
     setSearchOpen(false);
   }, [unratedSearchResults, rankings, scheduleCloudSync]);
 
-  // Rate a specific search result
   const handleSearchRate = useCallback(
     (name: string, rating: number) => {
       const newRankings = { ...rankings, [name]: rating };
@@ -498,43 +478,45 @@ function RatePageContent() {
     [rankings, scheduleCloudSync]
   );
 
+  // Rate a dish — for 5-button mode. Auto-advances for new dishes.
   const handleRate = useCallback(
     (rating: number) => {
       if (!currentItem) return;
+      const wasAlreadyRated = currentItem.name in rankings;
       const newRankings = { ...rankings, [currentItem.name]: rating };
       setRankings(newRankings);
       saveRankings(newRankings);
       scheduleCloudSync();
-      setHistory((prev) => [...prev, { name: currentItem.name, rating }]);
+      if (!wasAlreadyRated) {
+        setHistory((prev) => [...prev, { name: currentItem.name, rating }]);
+      }
       setRatingInput('');
-      setLastAction(null);
     },
     [currentItem, rankings, scheduleCloudSync]
   );
 
   const handleSkip = useCallback(() => {
     if (!currentItem) return;
+    const wasAlreadyRated = currentItem.name in rankings;
     const newRankings = { ...rankings, [currentItem.name]: -1 };
     setRankings(newRankings);
     saveRankings(newRankings);
     scheduleCloudSync();
-    setHistory((prev) => [...prev, { name: currentItem.name, rating: -1 }]);
+    if (!wasAlreadyRated) {
+      setHistory((prev) => [...prev, { name: currentItem.name, rating: -1 }]);
+    }
     setRatingInput('');
-    setLastAction(null);
   }, [currentItem, rankings, scheduleCloudSync]);
 
   const handleBack = useCallback(() => {
     if (history.length === 0) return;
     const prev = history[history.length - 1];
-    // Remove the rating so it shows as unrated again
     const newRankings = { ...rankings };
     delete newRankings[prev.name];
     setRankings(newRankings);
     saveRankings(newRankings);
     setHistory((h) => h.slice(0, -1));
-    // Restore the previous rating/skip state for highlighting
-    setLastAction(prev.rating);
-    setRatingInput(prev.rating > 0 ? String(prev.rating) : '');
+    setRatingInput('');
     setCurrentIndex(0);
   }, [history, rankings]);
 
@@ -566,6 +548,10 @@ function RatePageContent() {
     [ignoredCategories, scheduleCloudSync]
   );
 
+  // Get existing rating bucket for current dish (for re-rate highlighting)
+  const existingRating = currentItem ? rankings[currentItem.name] : undefined;
+  const existingBucket = existingRating !== undefined ? ratingToBucket(existingRating) : null;
+
   const progressPercent = totalItems > 0 ? Math.round((ratedCount / totalItems) * 100) : 0;
 
   return (
@@ -582,6 +568,9 @@ function RatePageContent() {
           <h1 className="text-lg font-bold text-white">Rate Dishes</h1>
           <p className="text-xs text-slate-500">
             {rateWeek ? 'Upcoming Week' : rateAll ? 'All Meals' : mealParam} · {ratedCount}/{totalItems} rated
+            {headlinersOnly && totalAllItems > totalItems && (
+              <span className="text-slate-600"> ({totalAllItems} total)</span>
+            )}
           </p>
         </div>
         <button
@@ -637,13 +626,13 @@ function RatePageContent() {
           <Sparkles className="w-4 h-4" />
         </button>
         <button
-          onClick={() => setEntreesOnly(!entreesOnly)}
+          onClick={() => setHeadlinersOnly(!headlinersOnly)}
           className={`w-9 h-9 flex items-center justify-center rounded-lg border transition-colors ${
-            entreesOnly
+            headlinersOnly
               ? 'bg-berkeley-gold text-berkeley-blue border-berkeley-gold'
               : 'bg-[#111827] border-slate-800 text-slate-400 hover:border-slate-600'
           }`}
-          title={entreesOnly ? 'Entrees only: ON' : 'Entrees only: OFF'}
+          title={headlinersOnly ? 'Headliners only: ON' : 'Headliners only: OFF (showing all items)'}
         >
           <Zap className="w-4 h-4" />
         </button>
@@ -688,7 +677,7 @@ function RatePageContent() {
         <p className="text-xs text-slate-600 mt-1 text-right">{progressPercent}%</p>
       </div>
 
-      {/* Pending Auto-Accept Banner — user must click Apply */}
+      {/* Pending Auto-Accept Banner */}
       {pendingAutoAccept.length > 0 && (
         <div className="bg-purple-900/20 rounded-lg border border-purple-500/30 p-4 mb-6">
           <div className="flex items-center justify-between mb-2">
@@ -720,39 +709,37 @@ function RatePageContent() {
                 <div key={item.name} className="flex items-center justify-between text-sm px-2 py-1.5 rounded bg-purple-900/20">
                   <span className="text-purple-200 truncate mr-2 flex-1 min-w-0">{item.name}</span>
                   <div className="flex items-center gap-1 shrink-0">
-                    {/* Quick rating buttons */}
-                    {[5, 6, 7, 8, 9, 10].map((n) => (
+                    {RATING_BUTTONS.slice(0, 4).map((btn) => (
                       <button
-                        key={n}
+                        key={btn.value}
                         onClick={() => setPendingAutoAccept((prev) =>
-                          prev.map((p) => p.name === item.name ? { ...p, rating: n } : p)
+                          prev.map((p) => p.name === item.name ? { ...p, rating: btn.value } : p)
                         )}
-                        className={`w-6 h-6 rounded text-xs font-medium transition-colors ${
-                          Math.round(item.rating) === n
+                        className={`w-7 h-7 rounded text-xs font-medium transition-colors ${
+                          ratingToBucket(item.rating) === btn.value
                             ? 'bg-purple-500 text-white'
                             : 'bg-purple-900/30 text-purple-400/60 hover:text-purple-300'
                         }`}
+                        title={btn.label}
                       >
-                        {n}
+                        {btn.emoji}
                       </button>
                     ))}
-                    {/* Skip toggle */}
                     <button
                       onClick={() => setPendingAutoAccept((prev) =>
                         prev.map((p) => p.name === item.name
-                          ? { ...p, rating: p.rating === -1 ? 5 : -1 }
+                          ? { ...p, rating: p.rating === -1 ? 6 : -1 }
                           : p
                         )
                       )}
-                      className={`px-1.5 h-6 rounded text-xs font-medium transition-colors ${
+                      className={`px-1.5 h-7 rounded text-xs font-medium transition-colors ${
                         item.rating === -1
                           ? 'bg-red-600/40 text-red-200'
                           : 'bg-red-900/20 text-red-400/60 hover:text-red-300'
                       }`}
                     >
-                      skip
+                      {RATING_BUTTONS[4].emoji}
                     </button>
-                    {/* Remove from pending */}
                     <button
                       onClick={() => {
                         undoneItemsRef.current.add(item.name);
@@ -770,7 +757,7 @@ function RatePageContent() {
         </div>
       )}
 
-      {/* Applied Auto-Accept Review — undo available */}
+      {/* Applied Auto-Accept Review */}
       {autoAcceptedItems.length > 0 && (
         <div className="bg-slate-800/30 rounded-lg border border-slate-700/50 p-3 mb-6">
           <div className="flex items-center justify-between">
@@ -1012,18 +999,17 @@ function RatePageContent() {
                           ) : null}
                         </div>
                         {isExpanded && (
-                          <div className="px-3 pb-2 flex gap-1 items-center">
-                            <div className="flex gap-0.5">
-                              {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((n) => (
-                                <button
-                                  key={n}
-                                  onClick={() => { handleSearchRate(item.name, n); setExpandedSearchItem(null); }}
-                                  className="w-7 h-7 rounded text-xs font-medium bg-[#111827] border border-slate-700 text-slate-400 hover:border-berkeley-gold hover:text-berkeley-gold transition-colors"
-                                >
-                                  {n}
-                                </button>
-                              ))}
-                            </div>
+                          <div className="px-3 pb-2 flex gap-1 items-center flex-wrap">
+                            {RATING_BUTTONS.map((btn) => (
+                              <button
+                                key={btn.value}
+                                onClick={() => { handleSearchRate(item.name, btn.value); setExpandedSearchItem(null); }}
+                                className={`h-8 px-2.5 rounded text-xs font-medium transition-colors ${btn.defaultBg} text-slate-300 hover:opacity-80`}
+                              >
+                                <span>{btn.emoji}</span>
+                                <span className="hidden sm:inline ml-1">{btn.label}</span>
+                              </button>
+                            ))}
                             <form onSubmit={(e) => {
                               e.preventDefault();
                               const val = parseFloat(searchRatingInput);
@@ -1070,6 +1056,14 @@ function RatePageContent() {
           <p className="text-slate-400 mb-6">
             You&apos;ve rated all {ratedCount} dishes for this meal.
           </p>
+          {headlinersOnly && totalAllItems > totalItems && (
+            <button
+              onClick={() => setHeadlinersOnly(false)}
+              className="text-sm text-slate-500 hover:text-slate-300 mb-4 block mx-auto transition-colors"
+            >
+              Show all {totalAllItems - totalItems} hidden items
+            </button>
+          )}
           <Link
             href={`/?date=${dateParam}&meal=${mealParam}`}
             className="bg-berkeley-gold text-berkeley-blue font-semibold px-6 py-3 rounded-lg hover:bg-berkeley-lightgold transition-colors inline-block"
@@ -1123,10 +1117,16 @@ function RatePageContent() {
             {currentItem.description && currentItem.description !== currentItem.name && (
               <p className="text-sm text-slate-400">{currentItem.description}</p>
             )}
+            {/* Show existing rating if re-rating */}
+            {existingRating !== undefined && (
+              <p className="text-xs text-slate-500 mt-2">
+                Previously rated: {existingRating === -1 ? 'Skipped' : existingRating}
+              </p>
+            )}
           </div>
 
           {/* Prediction */}
-          {currentPrediction && currentPrediction.confidence >= 0.5 && (
+          {currentPrediction && currentPrediction.confidence >= 0.5 && existingRating === undefined && (
             <div className={`border-t border-slate-800 px-6 py-4 ${
               currentPrediction.predictedSkip ? 'bg-red-900/10' : 'bg-purple-900/10'
             }`}>
@@ -1180,69 +1180,136 @@ function RatePageContent() {
 
           {/* Rating input */}
           <div className="border-t border-slate-800 p-6">
-            <form onSubmit={handleSubmit} className="flex gap-3">
-              <input
-                type="number"
-                min="1"
-                max="10"
-                step="0.5"
-                value={ratingInput}
-                onChange={(e) => setRatingInput(e.target.value)}
-                placeholder="1-10"
-                autoFocus
-                className="flex-1 bg-[#0a0f1a] border border-slate-700 rounded-lg px-4 py-3 text-white text-center text-lg font-semibold placeholder-slate-600 focus:outline-none focus:border-berkeley-gold transition-colors"
-              />
-              <button
-                type="submit"
-                disabled={!ratingInput}
-                className="bg-berkeley-gold text-berkeley-blue font-semibold px-6 py-3 rounded-lg hover:bg-berkeley-lightgold transition-colors disabled:opacity-30 disabled:cursor-not-allowed flex items-center gap-2"
-              >
-                <Star className="w-4 h-4" />
-                Rate
-              </button>
-            </form>
+            {preciseMode ? (
+              /* Precise mode: original slider + 1-10 buttons */
+              <>
+                <form onSubmit={handleSubmit} className="flex gap-3">
+                  <input
+                    type="number"
+                    min="1"
+                    max="10"
+                    step="0.5"
+                    value={ratingInput}
+                    onChange={(e) => setRatingInput(e.target.value)}
+                    placeholder="1-10"
+                    autoFocus
+                    className="flex-1 bg-[#0a0f1a] border border-slate-700 rounded-lg px-4 py-3 text-white text-center text-lg font-semibold placeholder-slate-600 focus:outline-none focus:border-berkeley-gold transition-colors"
+                  />
+                  <button
+                    type="submit"
+                    disabled={!ratingInput}
+                    className="bg-berkeley-gold text-berkeley-blue font-semibold px-6 py-3 rounded-lg hover:bg-berkeley-lightgold transition-colors disabled:opacity-30 disabled:cursor-not-allowed flex items-center gap-2"
+                  >
+                    <Star className="w-4 h-4" />
+                    Rate
+                  </button>
+                </form>
+                <div className="flex gap-1.5 mt-3 justify-center">
+                  {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((n) => (
+                    <button
+                      key={n}
+                      onClick={() => handleRate(n)}
+                      className={`w-9 h-9 rounded-md text-sm font-medium transition-colors ${
+                        existingRating === n
+                          ? 'bg-berkeley-gold text-berkeley-blue border border-berkeley-gold'
+                          : 'bg-[#0a0f1a] border border-slate-700 text-slate-400 hover:border-berkeley-gold hover:text-berkeley-gold'
+                      }`}
+                    >
+                      {n}
+                    </button>
+                  ))}
+                </div>
+                <div className="flex gap-2 mt-4">
+                  <button
+                    onClick={handleBack}
+                    disabled={history.length === 0}
+                    className="flex-1 py-2.5 text-slate-500 hover:text-slate-300 text-sm font-medium transition-colors flex items-center justify-center gap-1 disabled:opacity-30 disabled:cursor-not-allowed"
+                  >
+                    <ChevronLeft className="w-4 h-4" />
+                    Back
+                  </button>
+                  <button
+                    onClick={handleSkip}
+                    className="flex-1 py-2.5 text-sm font-medium transition-colors flex items-center justify-center gap-2 text-slate-500 hover:text-slate-300"
+                  >
+                    <SkipForward className="w-4 h-4" />
+                    Skip
+                  </button>
+                </div>
+              </>
+            ) : (
+              /* 5-button mode (default) */
+              <>
+                {/* Predicted bucket highlight */}
+                {currentPrediction && currentPrediction.confidence >= 0.5 && existingRating === undefined && (() => {
+                  const predBucket = predictionToBucket(currentPrediction);
+                  if (!predBucket) return null;
+                  return null; // prediction indicator handled via ring below
+                })()}
 
-            {/* Quick rating buttons */}
-            <div className="flex gap-1.5 mt-3 justify-center">
-              {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((n) => (
-                <button
-                  key={n}
-                  onClick={() => handleRate(n)}
-                  className={`w-9 h-9 rounded-md text-sm font-medium transition-colors ${
-                    lastAction === n
-                      ? 'bg-berkeley-gold text-berkeley-blue border border-berkeley-gold'
-                      : 'bg-[#0a0f1a] border border-slate-700 text-slate-400 hover:border-berkeley-gold hover:text-berkeley-gold'
-                  }`}
-                >
-                  {n}
-                </button>
-              ))}
-            </div>
+                {/* 5-button row */}
+                <div className="flex gap-2 justify-center" role="radiogroup" aria-label="Rate this dish">
+                  {RATING_BUTTONS.map((btn) => {
+                    const isActive = existingBucket === btn.value;
+                    const isPredicted = existingRating === undefined && currentPrediction && currentPrediction.confidence >= 0.5
+                      && predictionToBucket(currentPrediction)?.value === btn.value;
 
-            {/* Skip and Back buttons */}
-            <div className="flex gap-2 mt-4">
-              <button
-                onClick={handleBack}
-                disabled={history.length === 0}
-                className="flex-1 py-2.5 text-slate-500 hover:text-slate-300 text-sm font-medium transition-colors flex items-center justify-center gap-1 disabled:opacity-30 disabled:cursor-not-allowed"
-              >
-                <ChevronLeft className="w-4 h-4" />
-                Back
-              </button>
-              <button
-                onClick={handleSkip}
-                className={`flex-1 py-2.5 text-sm font-medium transition-colors flex items-center justify-center gap-2 ${
-                  lastAction === -1
-                    ? 'text-red-400'
-                    : 'text-slate-500 hover:text-slate-300'
-                }`}
-              >
-                <SkipForward className="w-4 h-4" />
-                {lastAction === -1 ? 'Skipped' : 'Skip'}
-              </button>
-            </div>
+                    return (
+                      <button
+                        key={btn.value}
+                        role="radio"
+                        aria-checked={isActive}
+                        aria-label={`${btn.label}, rating ${btn.value === -1 ? 'skip' : btn.value}`}
+                        onClick={() => btn.value === -1 ? handleSkip() : handleRate(btn.value)}
+                        className={`flex-1 min-w-0 h-14 rounded-xl text-sm font-semibold transition-all flex flex-col items-center justify-center gap-0.5 ${
+                          isActive
+                            ? `${btn.activeBg} ring-2 ${btn.activeRing}`
+                            : isPredicted
+                            ? `${btn.defaultBg} ring-2 ring-dashed ring-purple-400/60 text-slate-300`
+                            : `${btn.defaultBg} text-slate-400 hover:opacity-80`
+                        }`}
+                      >
+                        <span className="text-base">{btn.emoji}</span>
+                        <span className="hidden sm:block text-[10px] leading-none">{btn.label}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {/* Back button */}
+                <div className="flex gap-2 mt-4">
+                  <button
+                    onClick={handleBack}
+                    disabled={history.length === 0}
+                    className="flex-1 py-2.5 text-slate-500 hover:text-slate-300 text-sm font-medium transition-colors flex items-center justify-center gap-1 disabled:opacity-30 disabled:cursor-not-allowed"
+                  >
+                    <ChevronLeft className="w-4 h-4" />
+                    Back
+                  </button>
+                </div>
+              </>
+            )}
+
+            {/* Precise mode toggle */}
+            <button
+              onClick={() => setPreciseMode(!preciseMode)}
+              className="mt-3 text-xs text-slate-600 hover:text-slate-400 transition-colors flex items-center gap-1 mx-auto"
+            >
+              <SlidersHorizontal className="w-3 h-3" />
+              {preciseMode ? 'Switch to quick mode' : 'Switch to precise mode'}
+            </button>
           </div>
         </div>
+      )}
+
+      {/* Headliner expand toggle */}
+      {!loading && !weekLoading && headlinersOnly && totalAllItems > totalItems && currentItem && (
+        <button
+          onClick={() => setHeadlinersOnly(false)}
+          className="text-xs text-slate-600 hover:text-slate-400 transition-colors mt-3 block mx-auto"
+        >
+          Showing {totalItems} headliners — show all {totalAllItems} items
+        </button>
       )}
 
       {/* Remaining count */}

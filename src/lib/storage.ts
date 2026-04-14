@@ -1,4 +1,4 @@
-import { Rankings, DietaryPreferences, CategoryPreferences, HallDistances } from './types';
+import { Rankings, DietaryPreferences, CategoryPreferences, HallDistances, MealSize } from './types';
 
 const RANKINGS_KEY = 'croads_rankings';
 const IGNORED_CATEGORIES_KEY = 'croads_ignored_categories';
@@ -6,10 +6,13 @@ const DIETARY_PREFS_KEY = 'croads_dietary_preferences';
 const CATEGORY_PREFS_KEY = 'croads_category_preferences';
 const ONBOARDING_COMPLETE_KEY = 'croads_onboarding_complete';
 const AUTO_ACCEPT_KEY = 'croads_auto_accept';
-const ENTREES_ONLY_KEY = 'croads_entrees_only';
+const ENTREES_ONLY_KEY = 'croads_entrees_only'; // legacy, migrated to headliners_only
+const HEADLINERS_ONLY_KEY = 'croads_headliners_only';
+const PRECISE_MODE_KEY = 'croads_precise_mode';
 const VEGAN_MEAT_PREF_KEY = 'croads_vegan_meat_pref';
 const HALL_DISTANCES_KEY = 'croads_hall_distances';
 const BASELINE_SCORE_KEY = 'croads_baseline_score';
+const MEAL_SIZE_KEY = 'croads_meal_size';
 
 export function loadRankings(): Rankings {
   if (typeof window === 'undefined') return {};
@@ -163,4 +166,62 @@ export function saveBaselineScore(score: number | null): void {
   } else {
     localStorage.setItem(BASELINE_SCORE_KEY, String(score));
   }
+}
+
+// Migrate old entreesOnly → headlinersOnly (one-time)
+function migrateEntreesToHeadliners(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    if (localStorage.getItem(HEADLINERS_ONLY_KEY) === null) {
+      const old = localStorage.getItem(ENTREES_ONLY_KEY);
+      if (old !== null) {
+        localStorage.setItem(HEADLINERS_ONLY_KEY, old);
+      }
+    }
+  } catch {}
+}
+
+export function loadHeadlinersOnly(): boolean {
+  if (typeof window === 'undefined') return false;
+  migrateEntreesToHeadliners();
+  try {
+    return localStorage.getItem(HEADLINERS_ONLY_KEY) === 'true';
+  } catch {
+    return false;
+  }
+}
+
+export function saveHeadlinersOnly(enabled: boolean): void {
+  if (typeof window === 'undefined') return;
+  localStorage.setItem(HEADLINERS_ONLY_KEY, enabled ? 'true' : 'false');
+}
+
+export function loadPreciseMode(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    return localStorage.getItem(PRECISE_MODE_KEY) === 'true';
+  } catch {
+    return false;
+  }
+}
+
+export function savePreciseMode(enabled: boolean): void {
+  if (typeof window === 'undefined') return;
+  localStorage.setItem(PRECISE_MODE_KEY, enabled ? 'true' : 'false');
+}
+
+export function loadMealSize(): MealSize {
+  if (typeof window === 'undefined') return 2;
+  try {
+    const val = parseInt(localStorage.getItem(MEAL_SIZE_KEY) || '');
+    if (val >= 1 && val <= 4) return val as MealSize;
+    return 2;
+  } catch {
+    return 2;
+  }
+}
+
+export function saveMealSize(size: MealSize): void {
+  if (typeof window === 'undefined') return;
+  localStorage.setItem(MEAL_SIZE_KEY, String(size));
 }
