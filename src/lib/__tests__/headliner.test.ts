@@ -74,8 +74,8 @@ describe('filterToHeadliners — station bounds', () => {
     stationMap.forEach((items, station) => {
       const headliners = filterToHeadliners(items);
       // Stations with only condiments/sides may have 0 headliners (conditional min-1)
-      // But if any item scores >= 1, at least 1 should be selected
-      const hasAnyScoreable = items.some((item: MenuItem) => classifyDish(item).score >= 1);
+      // But if any item scores >= 2 (at least two positive signals), at least 1 should be selected
+      const hasAnyScoreable = items.some((item: MenuItem) => classifyDish(item).score >= 2);
       if (hasAnyScoreable) {
         expect(headliners.length).toBeGreaterThanOrEqual(1);
       }
@@ -124,5 +124,27 @@ describe('filterToHeadliners — empty station', () => {
   it('should return empty array for empty input', () => {
     const headliners = filterToHeadliners([]);
     expect(headliners).toEqual([]);
+  });
+});
+
+describe('filterToHeadliners — bare condiment station regression', () => {
+  it('should not promote cream cheeses / spreads as headliners', () => {
+    const items: MenuItem[] = [
+      makeItem('Chive Cream Cheese', 'Bagel Bar'),
+      makeItem('Plain Cream Cheese', 'Bagel Bar'),
+      makeItem('Strawberry Cream Cheese', 'Bagel Bar'),
+      makeItem('Butter', 'Bagel Bar'),
+    ];
+    const headliners = filterToHeadliners(items);
+    expect(headliners).toHaveLength(0);
+  });
+
+  it('should not promote single-signal long-name sides as headliners', () => {
+    const items: MenuItem[] = [
+      makeItem('Steel Cut Oatmeal', 'Grains'),
+      makeItem('Brown Sugar Topping', 'Grains'),
+    ];
+    const headliners = filterToHeadliners(items);
+    expect(headliners).toHaveLength(0);
   });
 });

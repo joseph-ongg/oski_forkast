@@ -218,8 +218,11 @@ export function filterToHeadliners(
     // Select headliners with min/max bounds
     let headliners = deduped.filter((s: ScoredItem) => s.isHeadliner);
 
-    // Conditional min: only promote if best item has score >= 1
-    if (headliners.length < minPerStation && deduped.length > 0 && deduped[0].score >= 1) {
+    // Conditional min: only promote if best item has score >= 2
+    // (score >= 1 promotes bare condiment/starch stations like Bagel Bar or Grains;
+    // requiring >= 2 ensures the item has at least two positive signals, e.g. protein
+    // or cuisine differentiator, not just "long name")
+    if (headliners.length < minPerStation && deduped.length > 0 && deduped[0].score >= 2) {
       headliners = deduped.slice(0, minPerStation);
     }
 
