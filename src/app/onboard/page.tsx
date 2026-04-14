@@ -2,15 +2,16 @@
 
 import { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
-import { CategoryPreferenceLevel, CategoryPreferences } from '@/lib/types';
-import { DietaryPreferences } from '@/lib/types';
+import { CategoryPreferenceLevel, CategoryPreferences, DietaryPreferences, HallDistances, MealSize } from '@/lib/types';
 import {
   saveCategoryPreferences,
   saveIgnoredCategories,
   saveDietaryPreferences,
   setOnboardingComplete,
   saveAutoAccept,
-  saveEntreesOnly,
+  saveHeadlinersOnly,
+  savePreciseMode,
+  saveMealSize,
   saveVeganMeatPref,
   saveHallDistances,
   saveBaselineScore,
@@ -18,15 +19,16 @@ import {
   loadIgnoredCategories,
   loadDietaryPreferences,
   loadAutoAccept,
-  loadEntreesOnly,
+  loadHeadlinersOnly,
+  loadPreciseMode,
+  loadMealSize,
   loadVeganMeatPref,
   loadHallDistances,
   loadBaselineScore,
   isOnboardingComplete,
 } from '@/lib/storage';
-import { HallDistances } from '@/lib/types';
 import { ONBOARDING_GROUPS, COMMON_SKIPPABLE_STATIONS } from '@/lib/onboarding';
-import { Utensils, ChevronRight, Sparkles, Zap, Leaf, Shield, MapPin, Store } from 'lucide-react';
+import { Utensils, ChevronRight, Sparkles, Zap, Leaf, Shield, MapPin, Store, SlidersHorizontal, UtensilsCrossed } from 'lucide-react';
 
 const DINING_HALLS = ['Crossroads', 'Cafe 3', 'Clark Kerr', 'Foothill'];
 
@@ -44,6 +46,13 @@ const DORM_PRESETS: Record<string, HallDistances> = {
 const COMMON_DIETS = ['Vegan Option', 'Vegetarian Option', 'Halal'];
 const COMMON_ALLERGENS = ['Milk', 'Egg', 'Wheat', 'Soy', 'Peanut', 'Tree Nut', 'Fish', 'Shellfish', 'Sesame', 'Gluten'];
 
+const MEAL_SIZE_OPTIONS: { size: MealSize; label: string; desc: string }[] = [
+  { size: 1, label: 'One main', desc: 'Just one dish' },
+  { size: 2, label: 'Main + side', desc: 'An entree and a side' },
+  { size: 3, label: 'Main + side + rice', desc: 'A full combo' },
+  { size: 4, label: 'Full plate', desc: 'I load up from everywhere' },
+];
+
 const LEVELS: { key: CategoryPreferenceLevel; label: string; color: string }[] = [
   { key: 'love', label: 'Love', color: 'bg-berkeley-gold text-berkeley-blue' },
   { key: 'good', label: 'Good', color: 'bg-blue-600/60 text-blue-100' },
@@ -57,7 +66,9 @@ export default function OnboardPage() {
   const [prefs, setPrefs] = useState<CategoryPreferences>({});
   const [ignoredStations, setIgnoredStations] = useState<Set<string>>(new Set());
   const [enableAutoAccept, setEnableAutoAccept] = useState(true);
-  const [enableEntreesOnly, setEnableEntreesOnly] = useState(true);
+  const [enableHeadlinersOnly, setEnableHeadlinersOnly] = useState(true);
+  const [enablePreciseMode, setEnablePreciseMode] = useState(false);
+  const [mealSize, setMealSize] = useState<MealSize>(2);
   const [veganMeat, setVeganMeat] = useState<boolean | null>(null); // null = not answered
   const [dietaryPrefs, setDietaryPrefs] = useState<DietaryPreferences>({ diets: [], allergens: [] });
   const [hallDists, setHallDists] = useState<HallDistances>({});
@@ -72,7 +83,9 @@ export default function OnboardPage() {
       const saved = loadIgnoredCategories();
       if (saved.length > 0) setIgnoredStations(new Set(saved));
       setEnableAutoAccept(loadAutoAccept());
-      setEnableEntreesOnly(loadEntreesOnly());
+      setEnableHeadlinersOnly(loadHeadlinersOnly());
+      setEnablePreciseMode(loadPreciseMode());
+      setMealSize(loadMealSize());
       const vm = loadVeganMeatPref();
       if (vm !== null) setVeganMeat(vm);
       setDietaryPrefs(loadDietaryPreferences());
@@ -114,7 +127,9 @@ export default function OnboardPage() {
       saveIgnoredCategories(Array.from(ignoredStations));
     }
     saveAutoAccept(enableAutoAccept);
-    saveEntreesOnly(enableEntreesOnly);
+    saveHeadlinersOnly(enableHeadlinersOnly);
+    savePreciseMode(enablePreciseMode);
+    saveMealSize(mealSize);
     if (dietaryPrefs.diets.length > 0 || dietaryPrefs.allergens.length > 0) {
       saveDietaryPreferences(dietaryPrefs);
     }
@@ -357,6 +372,38 @@ export default function OnboardPage() {
         </div>
       </div>
 
+      {/* Meal Size */}
+      <div className="bg-[#111827] rounded-lg p-4 border border-slate-800 mb-6">
+        <div className="flex items-center gap-2 mb-2">
+          <UtensilsCrossed className="w-4 h-4 text-berkeley-gold" />
+          <h3 className="text-sm font-semibold text-white">How much do you usually grab?</h3>
+        </div>
+        <p className="text-xs text-slate-400 mb-3">
+          This affects how scores are calculated — grazers benefit from halls with many good options.
+        </p>
+        <div className="grid grid-cols-2 gap-2">
+          {MEAL_SIZE_OPTIONS.map((opt) => {
+            const isActive = mealSize === opt.size;
+            return (
+              <button
+                key={opt.size}
+                onClick={() => setMealSize(opt.size)}
+                className={`p-3 rounded-lg text-left transition-colors border ${
+                  isActive
+                    ? 'bg-berkeley-gold/15 border-berkeley-gold/40 text-white'
+                    : 'bg-slate-800/50 border-slate-700 text-slate-400 hover:border-slate-500'
+                }`}
+              >
+                <span className={`text-sm font-medium block ${isActive ? 'text-berkeley-gold' : ''}`}>
+                  {opt.label}
+                </span>
+                <span className="text-xs text-slate-500">{opt.desc}</span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
       {/* Baseline Score */}
       <div className="bg-[#111827] rounded-lg p-4 border border-slate-800 mb-6">
         <div className="flex items-center gap-2 mb-2">
@@ -411,24 +458,48 @@ export default function OnboardPage() {
           </button>
 
           <button
-            onClick={() => setEnableEntreesOnly(!enableEntreesOnly)}
+            onClick={() => setEnableHeadlinersOnly(!enableHeadlinersOnly)}
             className={`w-full flex items-center gap-3 p-3 rounded-lg border transition-colors text-left ${
-              enableEntreesOnly
+              enableHeadlinersOnly
                 ? 'bg-berkeley-gold/10 border-berkeley-gold/30'
                 : 'bg-[#111827] border-slate-800'
             }`}
           >
-            <Zap className={`w-5 h-5 shrink-0 ${enableEntreesOnly ? 'text-berkeley-gold' : 'text-slate-600'}`} />
+            <Zap className={`w-5 h-5 shrink-0 ${enableHeadlinersOnly ? 'text-berkeley-gold' : 'text-slate-600'}`} />
             <div className="flex-1">
-              <span className={`text-sm font-medium ${enableEntreesOnly ? 'text-berkeley-gold' : 'text-slate-400'}`}>
-                Entrees only
+              <span className={`text-sm font-medium ${enableHeadlinersOnly ? 'text-berkeley-gold' : 'text-slate-400'}`}>
+                Headliners only
               </span>
               <p className="text-xs text-slate-500 mt-0.5">
-                Auto-skip condiments, dressings, toppings, and non-entree items. Only rate actual dishes.
+                Only rate main dishes — skips condiments, dressings, sides, and toppings.
               </p>
             </div>
             <div className={`w-10 h-6 rounded-full transition-colors flex items-center ${
-              enableEntreesOnly ? 'bg-berkeley-gold justify-end' : 'bg-slate-700 justify-start'
+              enableHeadlinersOnly ? 'bg-berkeley-gold justify-end' : 'bg-slate-700 justify-start'
+            }`}>
+              <div className="w-4 h-4 bg-white rounded-full mx-1" />
+            </div>
+          </button>
+
+          <button
+            onClick={() => setEnablePreciseMode(!enablePreciseMode)}
+            className={`w-full flex items-center gap-3 p-3 rounded-lg border transition-colors text-left ${
+              enablePreciseMode
+                ? 'bg-slate-700/30 border-slate-600'
+                : 'bg-[#111827] border-slate-800'
+            }`}
+          >
+            <SlidersHorizontal className={`w-5 h-5 shrink-0 ${enablePreciseMode ? 'text-slate-300' : 'text-slate-600'}`} />
+            <div className="flex-1">
+              <span className={`text-sm font-medium ${enablePreciseMode ? 'text-slate-200' : 'text-slate-400'}`}>
+                Precise ratings
+              </span>
+              <p className="text-xs text-slate-500 mt-0.5">
+                Use a 1–10 slider instead of quick buttons for more granular control.
+              </p>
+            </div>
+            <div className={`w-10 h-6 rounded-full transition-colors flex items-center ${
+              enablePreciseMode ? 'bg-slate-500 justify-end' : 'bg-slate-700 justify-start'
             }`}>
               <div className="w-4 h-4 bg-white rounded-full mx-1" />
             </div>
